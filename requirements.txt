@@ -1,0 +1,4 @@
+﻿streamlit>=1.40
+pandas>=2.2
+xgboost>=2.1
+numpy
