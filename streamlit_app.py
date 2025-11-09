@@ -154,7 +154,7 @@ def nice_kick(dt: datetime)->str:
 # ---------------------------------------------
 # APP LAYOUT
 # ---------------------------------------------
-st.title("🏈 DJBets NFL Predictor — Live Auto Git Mode")
+st.title("🏈 DJBets NFL Predictor")
 
 sched = load_latest_schedule()
 hist = load_latest_history()
