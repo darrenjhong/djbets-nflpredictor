@@ -65,7 +65,18 @@ def load_historical_data():
 
 @st.cache_resource
 def load_or_train_model():
-    model = xgb.XGBClassifier()
+    model = xgb.XGBClassifier(
+    eval_metric="logloss",
+    use_label_encoder=False,
+    tree_method="approx",  # ✅ Use CPU-friendly, compatible mode
+    n_estimators=150,
+    max_depth=4,
+    learning_rate=0.08,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    )
+    model.fit(X.values, y.values)
+
     if os.path.exists(MODEL_FILE):
         try:
             model.load_model(MODEL_FILE)
