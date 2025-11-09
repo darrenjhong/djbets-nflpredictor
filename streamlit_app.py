@@ -151,7 +151,7 @@ if week_df.empty:
 # 🧮 Predictions
 # --------------------------------------------------------------
 feats = pd.DataFrame({
-    "elo_diff": week_df["elo_home"] - week_df["elo_away"],
+    "elo_diff": week_df.get("elo_home", pd.Series([1500] * len(week_df))) - week_df.get("elo_away", pd.Series([1500] * len(week_df))),
     "inj_diff": np.random.randn(len(week_df)),
     "temp_c": week_df["temp_c"],
     "wind_kph": week_df["wind_kph"],
@@ -159,6 +159,50 @@ feats = pd.DataFrame({
 })
 probs = model.predict_proba(feats)[:, 1]
 week_df["home_win_prob"] = (probs * 100).round(1)
+
+
+# --------------------------------------------------------------
+# 🧮 Compute Elo Difference (Safe) + Visualizations
+# --------------------------------------------------------------
+import matplotlib.pyplot as plt
+
+# Safe Elo defaults — handle missing columns gracefully
+week_df["elo_home"] = week_df.get("elo_home", pd.Series([1500] * len(week_df)))
+week_df["elo_away"] = week_df.get("elo_away", pd.Series([1500] * len(week_df)))
+week_df["elo_diff"] = week_df["elo_home"] - week_df["elo_away"]
+
+# --------------------------------------------------------------
+# 📊 Elo Comparison Chart
+# --------------------------------------------------------------
+st.markdown("### ⚔️ Team Elo Comparison")
+
+for _, row in week_df.iterrows():
+    home = row["home_team"]
+    away = row["away_team"]
+    elo_home = row["elo_home"]
+    elo_away = row["elo_away"]
+
+    fig, ax = plt.subplots(figsize=(4, 0.4))
+    ax.barh([home, away], [elo_home, elo_away])
+    ax.set_xlim(1200, 1800)
+    ax.set_xlabel("Elo Rating")
+    ax.set_title(f"{away} @ {home}")
+    st.pyplot(fig)
+
+# --------------------------------------------------------------
+# 📈 Predicted Win Probability Visualization
+# --------------------------------------------------------------
+if "predicted_winner" in week_df.columns and "home_win_prob" in week_df.columns:
+    st.markdown("### 🧩 Win Probability (Home Team)")
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.barh(week_df["home_team"], week_df["home_win_prob"], color="deepskyblue")
+    ax.set_xlabel("Home Win Probability")
+    ax.set_xlim(0, 1)
+    st.pyplot(fig)
+else:
+    st.info("No win probability data available yet.")
+
 
 # --------------------------------------------------------------
 # 🎨 Layout
