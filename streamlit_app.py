@@ -1,282 +1,181 @@
-﻿# ==============================================================
-# 🌟 DJBets NFL Predictor v9.7-S - Interactive + Logos Edition
-# ==============================================================
-
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
-import numpy as np
 import xgboost as xgb
 from datetime import datetime
 import matplotlib.pyplot as plt
 import os
 
 # --------------------------------------------------------------
-# ⚙️ Initialization
+# ⚙️ Page Configuration
 # --------------------------------------------------------------
+st.set_page_config(
+    page_title="DJBets NFL Predictor",
+    page_icon="🏈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-DEFAULT_SEASON = 2025
-DEFAULT_WEEK = 1
-MAX_WEEKS = 18
+st.markdown("""
+<style>
+    body { background-color: #0E1117; color: #FAFAFA; }
+    .stApp { background-color: #0E1117; }
+    h1, h2, h3, h4, h5, h6 { color: #FAFAFA !important; }
+    .css-1d391kg, .css-1v3fvcr, .css-1offfwp { color: #FAFAFA !important; }
+</style>
+""", unsafe_allow_html=True)
 
-session_defaults = {
-    "season": DEFAULT_SEASON,
-    "week": DEFAULT_WEEK,
-    "model_trained": False,
-    "schedule_loaded": False,
-    "active_schedule_file": None,
-    "active_historical_file": None,
-    "selected_game": None,
-    "refresh_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-}
 
-for k, v in session_defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# --------------------------------------------------------------
+# 📂 Data Loaders (auto-train on first run)
+# --------------------------------------------------------------
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+SCHEDULE_FILE = os.path.join(DATA_DIR, "schedule.csv")
+HISTORICAL_FILE = os.path.join(DATA_DIR, "historical.csv")
+MODEL_FILE = os.path.join(DATA_DIR, "nfl_xgb_model.json")
+
+@st.cache_data
+def load_latest_schedule():
+    if not os.path.exists(SCHEDULE_FILE):
+        st.warning("⚠️ No schedule file found. Please upload schedule.csv to the data folder.")
+        return pd.DataFrame()
+
+    df = pd.read_csv(SCHEDULE_FILE)
+    # Normalize column names
+    df.columns = [c.lower().strip() for c in df.columns]
+    if "kickoff_et" not in df.columns:
+        for possible in ["kickoff", "date", "time"]:
+            if possible in df.columns:
+                df.rename(columns={possible: "kickoff_et"}, inplace=True)
+                break
+    if "kickoff_et" not in df.columns:
+        st.warning("⚠️ No 'kickoff/date/time' column found — setting kickoff_et blank.")
+        df["kickoff_et"] = ""
+    else:
+        df["kickoff_et"] = pd.to_datetime(df["kickoff_et"], errors="coerce").dt.strftime("%a %b %d, %I:%M %p")
+
+    return df
+
+@st.cache_data
+def load_historical_data():
+    if not os.path.exists(HISTORICAL_FILE):
+        st.warning("⚠️ No historical data file found in /data.")
+        return pd.DataFrame()
+    return pd.read_csv(HISTORICAL_FILE)
+
+@st.cache_resource
+def load_or_train_model():
+    model = xgb.XGBClassifier()
+    if os.path.exists(MODEL_FILE):
+        try:
+            model.load_model(MODEL_FILE)
+            return model
+        except Exception:
+            st.warning("⚠️ Model file invalid, retraining instead.")
+
+    hist = load_historical_data()
+    if hist.empty:
+        st.warning("⚠️ No training data found; using default model.")
+        return model
+
+    # Minimal training data fallback
+    hist["elo_diff"] = hist.get("elo_home", 1500) - hist.get("elo_away", 1500)
+    X = hist[["elo_diff"]] if "elo_diff" in hist else pd.DataFrame([[0]], columns=["elo_diff"])
+    y = (hist["home_score"] > hist["away_score"]).astype(int) if "home_score" in hist else [0]
+    model.fit(X, y)
+    model.save_model(MODEL_FILE)
+    return model
+
 
 # --------------------------------------------------------------
 # 🎛️ Sidebar Controls
 # --------------------------------------------------------------
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 
-# --- Season Dropdown ---
-# You can easily extend this to 2026+ in the future
-season_options = sorted([2023, 2024, 2025], reverse=True)
+season_options = sorted([2025, 2024, 2023], reverse=True)
 st.sidebar.selectbox("Season", season_options, index=0, key="season")
 
-# --- Week Dropdown ---
-# Dynamically populate based on loaded schedule (if available)
-if "sched" in locals() and not sched.empty and "week" in sched.columns:
-    available_weeks = sorted(sched["week"].unique().tolist())
-else:
-    available_weeks = list(range(1, MAX_WEEKS + 1))
-
+MAX_WEEKS = 18
+sched = load_latest_schedule()
+available_weeks = sorted(sched["week"].unique().tolist()) if "week" in sched.columns and not sched.empty else list(range(1, MAX_WEEKS + 1))
 st.sidebar.selectbox("Week", available_weeks, index=0, key="week")
 
+show_elo = st.sidebar.checkbox("📊 Show Elo Ratings", value=True)
+show_weather = st.sidebar.checkbox("🌦️ Show Weather", value=True)
 
-# --- Reset Session Button ---
-
-if st.sidebar.button("🔄 Reset Session"):
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.experimental_rerun()
 
 # --------------------------------------------------------------
-# 📂 Data Loaders
+# 🧠 Load Model + Data
 # --------------------------------------------------------------
-@st.cache_data
-def load_schedule(season):
-    path = f"data/schedule_{season}.csv"
-    if not os.path.exists(path):
-        teams = [
-            "Chiefs", "Eagles", "Bills", "49ers", "Ravens",
-            "Cowboys", "Lions", "Dolphins", "Jets", "Packers",
-            "Bengals", "Texans", "Seahawks", "Chargers", "Vikings", "Bears"
-        ]
-        data = []
-        for w in range(1, MAX_WEEKS + 1):
-            np.random.shuffle(teams)
-            for i in range(0, len(teams), 2):
-                data.append({
-                    "season": season,
-                    "week": w,
-                    "home_team": teams[i],
-                    "away_team": teams[i+1],
-                    "kickoff_et": datetime(2025, 9, 5, 13, 0) + pd.to_timedelta((w-1)*7, "d"),
-                    "spread": round(np.random.uniform(-7, 7), 1),
-                    "elo_home": np.random.randint(1450, 1700),
-                    "elo_away": np.random.randint(1450, 1700),
-                    "temp_c": np.random.uniform(-5, 30),
-                    "wind_kph": np.random.uniform(0, 40),
-                    "precip_prob": np.random.uniform(0, 1),
-                })
-        df = pd.DataFrame(data)
-        os.makedirs("data", exist_ok=True)
-        df.to_csv(path, index=False)
-    else:
-        df = pd.read_csv(path)
-    df["kickoff_et"] = pd.to_datetime(df["kickoff_et"], errors="coerce")
-    return df
+model = load_or_train_model()
+season = st.session_state["season"]
+week = st.session_state["week"]
 
-@st.cache_data
-def load_historical():
-    path = "data/historical.csv"
-    if not os.path.exists(path):
-        np.random.seed(42)
-        df = pd.DataFrame({
-            "elo_diff": np.random.randn(200),
-            "inj_diff": np.random.randn(200),
-            "temp_c": np.random.uniform(-5, 30, 200),
-            "wind_kph": np.random.uniform(0, 40, 200),
-            "precip_prob": np.random.uniform(0, 1, 200),
-            "home_win": np.random.choice([0, 1], 200)
-        })
-        os.makedirs("data", exist_ok=True)
-        df.to_csv(path, index=False)
-    else:
-        df = pd.read_csv(path)
-    return df
+if sched.empty:
+    st.stop()
 
-# --------------------------------------------------------------
-# 🤖 Model
-# --------------------------------------------------------------
-@st.cache_resource
-def train_or_load_model():
-    model_path = "data/xgb_model.json"
-    if os.path.exists(model_path):
-        model = xgb.XGBClassifier()
-        try:
-            model.load_model(model_path)
-            return model
-        except:
-            pass
-    df = load_historical()
-    X = df[["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]]
-    y = df["home_win"]
-    model = xgb.XGBClassifier(n_estimators=150, learning_rate=0.1, max_depth=4)
-    model.fit(X, y)
-    model.save_model(model_path)
-    return model
-
-model = train_or_load_model()
-schedule = load_schedule(st.session_state["season"])
-st.session_state["active_schedule_file"] = f"schedule_{st.session_state['season']}.csv"
-st.session_state["active_historical_file"] = "historical.csv"
-
-week_df = schedule[schedule["week"] == st.session_state["week"]]
+week_df = sched[(sched["season"] == season) & (sched["week"] == week)] if "season" in sched.columns else pd.DataFrame()
 if week_df.empty:
     st.warning("No games found for this week.")
     st.stop()
 
-# --------------------------------------------------------------
-# 🧮 Predictions
-# --------------------------------------------------------------
-feats = pd.DataFrame({
-    "elo_diff": week_df.get("elo_home", pd.Series([1500] * len(week_df))) - week_df.get("elo_away", pd.Series([1500] * len(week_df))),
-    "inj_diff": np.random.randn(len(week_df)),
-    "temp_c": week_df["temp_c"],
-    "wind_kph": week_df["wind_kph"],
-    "precip_prob": week_df["precip_prob"],
-})
-probs = model.predict_proba(feats)[:, 1]
-week_df["home_win_prob"] = (probs * 100).round(1)
-
 
 # --------------------------------------------------------------
-# 🧮 Compute Elo Difference (Safe) + Visualizations
+# 🧮 Compute Predictions
 # --------------------------------------------------------------
-import matplotlib.pyplot as plt
-
-# Safe Elo defaults — handle missing columns gracefully
 week_df["elo_home"] = week_df.get("elo_home", pd.Series([1500] * len(week_df)))
 week_df["elo_away"] = week_df.get("elo_away", pd.Series([1500] * len(week_df)))
 week_df["elo_diff"] = week_df["elo_home"] - week_df["elo_away"]
 
+for col, default in {"temp_c": 20, "wind_kph": 5, "precip_prob": 0}.items():
+    if col not in week_df.columns:
+        week_df[col] = default
+
+X = week_df[["elo_diff", "temp_c", "wind_kph", "precip_prob"]]
+try:
+    week_df["home_win_prob"] = model.predict_proba(X)[:, 1]
+except Exception as e:
+    st.error(f"Prediction error: {e}")
+    week_df["home_win_prob"] = 0.5
+
+
 # --------------------------------------------------------------
-# 📊 Elo Comparison Chart
+# 🏟️ Display Predictions
 # --------------------------------------------------------------
-st.markdown("### ⚔️ Team Elo Comparison")
+st.title(f"🏈 DJBets NFL Predictor")
+st.subheader(f"Week {week} — Season {season}")
 
 for _, row in week_df.iterrows():
-    home = row["home_team"]
-    away = row["away_team"]
-    elo_home = row["elo_home"]
-    elo_away = row["elo_away"]
+    home, away = row["home_team"], row["away_team"]
+    home_prob = row["home_win_prob"]
+    kickoff = row.get("kickoff_et", "")
+    elo_h, elo_a = row["elo_home"], row["elo_away"]
 
-    fig, ax = plt.subplots(figsize=(4, 0.4))
-    ax.barh([home, away], [elo_home, elo_away])
-    ax.set_xlim(1200, 1800)
-    ax.set_xlabel("Elo Rating")
-    ax.set_title(f"{away} @ {home}")
-    st.pyplot(fig)
+    col1, col2 = st.columns([3, 2])
 
-# --------------------------------------------------------------
-# 📈 Predicted Win Probability Visualization
-# --------------------------------------------------------------
-if "predicted_winner" in week_df.columns and "home_win_prob" in week_df.columns:
-    st.markdown("### 🧩 Win Probability (Home Team)")
+    with col1:
+        st.markdown(f"### {home} 🏠 vs ✈️ {away}")
+        st.caption(f"Kickoff: {kickoff}")
+        st.progress(home_prob)
+        st.write(f"**Predicted Winner:** {'🏠 ' + home if home_prob >= 0.5 else '✈️ ' + away}")
+        st.caption(f"Home Win Probability: {home_prob:.1%}")
 
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.barh(week_df["home_team"], week_df["home_win_prob"], color="deepskyblue")
-    ax.set_xlabel("Home Win Probability")
-    ax.set_xlim(0, 1)
-    st.pyplot(fig)
-else:
-    st.info("No win probability data available yet.")
+        if show_weather:
+            st.caption(f"🌡️ {row['temp_c']}°C | 💨 {row['wind_kph']} km/h | 🌧️ {row['precip_prob']}% rain chance")
 
+    if show_elo:
+        with col2:
+            fig, ax = plt.subplots(figsize=(3, 1))
+            ax.barh([home, away], [elo_h, elo_a], color=["#1f77b4", "#ff7f0e"])
+            ax.set_xlabel("Elo Rating")
+            ax.set_xlim(1200, 1800)
+            plt.tight_layout()
+            st.pyplot(fig)
 
-# --------------------------------------------------------------
-# 🎨 Layout
-# --------------------------------------------------------------
-st.title("🏈 DJBets NFL Predictor")
-st.markdown(f"### Season {st.session_state['season']} — Week {st.session_state['week']}")
-st.caption(
-    f"Data: {st.session_state['active_schedule_file']} | "
-    f"Updated {st.session_state['refresh_time']}"
-)
-
-# --------------------------------------------------------------
-# 🧩 Game Cards
-# --------------------------------------------------------------
-st.markdown("### 🕹️ Click on a matchup to view analysis")
-
-for _, game in week_df.iterrows():
-    home = game["home_team"]
-    away = game["away_team"]
-    key = f"{home}_vs_{away}_W{int(game['week'])}"
-
-    with st.container(border=True):
-        cols = st.columns([3, 1, 3])
-        with cols[0]:
-            st.image(f"public/logos/{away.lower()}.png", width=70)
-            st.subheader(away)
-            st.text("Away")
-        with cols[1]:
-            st.markdown("#### 🕒")
-            st.write(game["kickoff_et"].strftime("%a, %b %d %I:%M %p"))
-            st.write(f"Spread: {game['spread']:+}")
-            if st.button("View Details", key=key):
-                st.session_state["selected_game"] = key
-                st.session_state["selected_data"] = game
-                st.experimental_rerun()
-        with cols[2]:
-            st.image(f"public/logos/{home.lower()}.png", width=70)
-            st.subheader(home)
-            st.progress(float(game["home_win_prob"]) / 100)
-            st.text(f"Win %: {game['home_win_prob']}")
-
-# --------------------------------------------------------------
-# 📊 Details Popup
-# --------------------------------------------------------------
-if st.session_state.get("selected_game"):
-    game = st.session_state["selected_data"]
     st.markdown("---")
-    st.markdown(f"## 🧠 Matchup Analysis: {game['away_team']} @ {game['home_team']}")
-    st.write(f"**Kickoff:** {game['kickoff_et'].strftime('%A, %b %d %I:%M %p')}")
-    st.write(f"**ELO Home:** {game['elo_home']} | **ELO Away:** {game['elo_away']}")
-    st.write(f"**Weather:** {game['temp_c']:.1f}°C, {game['wind_kph']:.1f} km/h wind, {game['precip_prob']*100:.0f}% rain chance")
-    st.write(f"**Vegas Spread:** {game['spread']:+}")
-    st.write(f"**Model Home Win Probability:** {game['home_win_prob']}%")
 
-    # Visual
-    st.markdown("### 📈 Win Probability Factors")
-    fig, ax = plt.subplots()
-    features = ["ELO Diff", "Injury Diff", "Temp °C", "Wind (kph)", "Precip Prob"]
-    values = [
-        game["elo_home"] - game["elo_away"],
-        np.random.randn(),
-        game["temp_c"],
-        game["wind_kph"],
-        game["precip_prob"] * 100,
-    ]
-    ax.barh(features, values, color=["#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3", "#a6d854"])
-    st.pyplot(fig)
-
-    if st.button("⬅️ Back to Week View"):
-        st.session_state["selected_game"] = None
-        st.experimental_rerun()
 
 # --------------------------------------------------------------
-# 🧾 Footer
+# 📅 Footer
 # --------------------------------------------------------------
-st.markdown("---")
-st.caption(f"🏈 DJBets NFL Predictor v9.7-S • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"🔄 Data: {SCHEDULE_FILE} | Model: {MODEL_FILE} | Updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
