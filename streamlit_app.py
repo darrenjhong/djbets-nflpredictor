@@ -17,18 +17,48 @@ SCHED_PATTERN = "schedule_*.csv"
 # ---------------------------------------------
 # LOAD DATA (ALWAYS PICK LATEST)
 # ---------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_latest_schedule():
-    files = sorted(DATA_DIR.glob(SCHED_PATTERN))
+@st.cache_data(ttl=0)
+def load_latest_schedule() -> pd.DataFrame:
+    """
+    Always load the newest schedule CSV from /data/ and normalize column names.
+    Handles missing or mismatched datetime columns gracefully.
+    """
+    from pathlib import Path
+
+    files = sorted(Path("data").glob("schedule_*.csv"))
     if not files:
-        st.error("No schedule file found in /data.")
+        st.error("❌ No schedule CSV found in /data/. Please upload a file named like schedule_2025.csv")
         st.stop()
+
     latest = files[-1]
-    df = pd.read_csv(latest)
-    df["kickoff_et"] = pd.to_datetime(df["kickoff_et"])
     st.session_state["active_schedule_file"] = latest.name
-    st.session_state["season"] = int(latest.stem.split("_")[-1])
+    df = pd.read_csv(latest)
+
+    # Normalize column names
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    # Try to locate a kickoff/datetime column
+    datetime_cols = [c for c in df.columns if "kick" in c or "date" in c or "time" in c]
+    if datetime_cols:
+        col = datetime_cols[0]
+        try:
+            df["kickoff_et"] = pd.to_datetime(df[col], errors="coerce")
+        except Exception as e:
+            st.warning(f"⚠️ Could not parse '{col}' as datetime ({e}); using NaT instead.")
+            df["kickoff_et"] = pd.NaT
+    else:
+        st.warning("⚠️ No 'kickoff/date/time' column found — setting kickoff_et to blank.")
+        df["kickoff_et"] = pd.NaT
+
+    # Fill missing required columns if absent
+    for col in ["home_team", "away_team", "week"]:
+        if col not in df.columns:
+            df[col] = None
+            st.warning(f"Added missing column: '{col}' (was not in CSV)")
+
     return df
+
+
 
 @st.cache_data(show_spinner=False)
 def load_latest_history():
