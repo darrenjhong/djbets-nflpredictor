@@ -37,8 +37,23 @@ for k, v in session_defaults.items():
 # 🎛️ Sidebar Controls
 # --------------------------------------------------------------
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
-st.sidebar.selectbox("Season", [2025, 2024, 2023], index=0, key="season")
-st.sidebar.number_input("Week", 1, MAX_WEEKS, step=1, key="week")
+
+# --- Season Dropdown ---
+# You can easily extend this to 2026+ in the future
+season_options = sorted([2023, 2024, 2025], reverse=True)
+st.sidebar.selectbox("Season", season_options, index=0, key="season")
+
+# --- Week Dropdown ---
+# Dynamically populate based on loaded schedule (if available)
+if "sched" in locals() and not sched.empty and "week" in sched.columns:
+    available_weeks = sorted(sched["week"].unique().tolist())
+else:
+    available_weeks = list(range(1, MAX_WEEKS + 1))
+
+st.sidebar.selectbox("Week", available_weeks, index=0, key="week")
+
+
+# --- Reset Session Button ---
 
 if st.sidebar.button("🔄 Reset Session"):
     for key in list(st.session_state.keys()):
