@@ -14,6 +14,38 @@ DATA_DIR = Path("data")
 HIST_PATTERN = "historical*.csv"
 SCHED_PATTERN = "schedule_*.csv"
 
+
+# ==============================================================
+# 🌟 DJBets NFL Predictor - Session State Initialization
+# ==============================================================
+
+DEFAULT_SEASON = 2025
+DEFAULT_WEEK = 1
+
+# --- Initialize Streamlit session_state keys safely ---
+session_defaults = {
+    "season": DEFAULT_SEASON,
+    "week": DEFAULT_WEEK,
+    "model_trained": False,
+    "schedule_loaded": False,
+    "active_schedule_file": None,
+    "selected_game": None,
+    "refresh_time": None,
+}
+
+for key, default_val in session_defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_val
+
+# --- Convenience references ---
+season = st.session_state["season"]
+week = st.session_state["week"]
+
+st.sidebar.markdown("## 🏈 DJBets NFL Predictor Controls")
+st.sidebar.write(f"**Season:** {season}")
+st.sidebar.write(f"**Week:** {week}")
+
+
 # ---------------------------------------------
 # LOAD DATA (ALWAYS PICK LATEST)
 # ---------------------------------------------
@@ -130,6 +162,12 @@ season = st.session_state["season"]
 weeks = sorted(sched["week"].unique())
 wk = st.sidebar.selectbox("Week", weeks, index=min(len(weeks)-1, 0))
 slots = st.sidebar.multiselect("Slots", ["TNF","SUN-1","SUN-2","SNF","MNF"], default=[])
+
+if st.sidebar.button("🔄 Reset App Session"):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.experimental_rerun()
+
 
 df_week = sched[(sched["season"]==season) & (sched["week"]==wk)].copy()
 if slots:
