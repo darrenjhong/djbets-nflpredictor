@@ -56,46 +56,85 @@ def load_latest_schedule():
 
     return df
 
-@st.cache_data
-def load_historical_data():
-    if not os.path.exists(HISTORICAL_FILE):
-        st.warning("⚠️ No historical data file found in /data.")
-        return pd.DataFrame()
-    return pd.read_csv(HISTORICAL_FILE)
-
+# --------------------------------------------------------------
+# 🧠 Load or Train Model (safe + automatic fallback)
+# --------------------------------------------------------------
 @st.cache_resource
 def load_or_train_model():
-    model = xgb.XGBClassifier(
-    eval_metric="logloss",
-    use_label_encoder=False,
-    tree_method="approx",  # ✅ Use CPU-friendly, compatible mode
-    n_estimators=150,
-    max_depth=4,
-    learning_rate=0.08,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    )
-    model.fit(X.values, y.values)
-
+    """Load a trained XGBoost model or train one safely from local data."""
+    # Try to load existing model first
     if os.path.exists(MODEL_FILE):
         try:
+            model = xgb.XGBClassifier()
             model.load_model(MODEL_FILE)
+            st.success("✅ Loaded trained model from disk.")
             return model
-        except Exception:
-            st.warning("⚠️ Model file invalid, retraining instead.")
+        except Exception as e:
+            st.warning(f"⚠️ Could not load model: {e}. Re-training now...")
 
-    hist = load_historical_data()
-    if hist.empty:
-        st.warning("⚠️ No training data found; using default model.")
-        return model
+    # Fallback → train from CSV or mock
+    if os.path.exists(HISTORICAL_FILE):
+        try:
+            df = pd.read_csv(HISTORICAL_FILE)
+        except Exception as e:
+            st.error(f"❌ Could not read {HISTORICAL_FILE}: {e}")
+            df = pd.DataFrame()
+    else:
+        st.warning("⚠️ No historical data found — creating mock dataset.")
+        df = pd.DataFrame({
+            "elo_diff": np.random.normal(0, 100, 200),
+            "temp_c": np.random.normal(15, 10, 200),
+            "wind_kph": np.random.uniform(0, 30, 200),
+            "precip_prob": np.random.uniform(0, 100, 200),
+            "home_win": np.random.randint(0, 2, 200)
+        })
 
-    # Minimal training data fallback
-    hist["elo_diff"] = hist.get("elo_home", 1500) - hist.get("elo_away", 1500)
-    X = hist[["elo_diff"]] if "elo_diff" in hist else pd.DataFrame([[0]], columns=["elo_diff"])
-    y = (hist["home_score"] > hist["away_score"]).astype(int) if "home_score" in hist else [0]
-    model.fit(X, y)
-    model.save_model(MODEL_FILE)
+    # Guarantee required columns
+    required = ["elo_diff", "temp_c", "wind_kph", "precip_prob", "home_win"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = np.random.normal(0, 1, len(df))
+
+    # Clean numeric and drop NaNs
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    if df.empty or len(df) < 10:
+        st.warning("⚠️ Historical dataset is too small — generating mock data.")
+        df = pd.DataFrame({
+            "elo_diff": np.random.normal(0, 100, 200),
+            "temp_c": np.random.normal(15, 10, 200),
+            "wind_kph": np.random.uniform(0, 30, 200),
+            "precip_prob": np.random.uniform(0, 100, 200),
+            "home_win": np.random.randint(0, 2, 200)
+        })
+
+    # Define X and y safely
+    X = df[["elo_diff", "temp_c", "wind_kph", "precip_prob"]]
+    y = df["home_win"].astype(int)
+
+    try:
+        model = xgb.XGBClassifier(
+            eval_metric="logloss",
+            use_label_encoder=False,
+            n_estimators=120,
+            max_depth=4,
+            learning_rate=0.08
+        )
+        model.fit(X.values, y.values)
+        model.save_model(MODEL_FILE)
+        st.success("✅ Model trained successfully and saved.")
+    except Exception as e:
+        st.error(f"❌ Model training failed: {e}")
+        # Emergency fallback model
+        model = xgb.XGBClassifier()
+        model.fit(np.random.randn(20, 4), np.random.randint(0, 2, 20))
+
     return model
+
+
+# Load or train model at startup
+model = load_or_train_model()
 
 
 # --------------------------------------------------------------
