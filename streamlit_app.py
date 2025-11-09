@@ -1,157 +1,129 @@
-﻿import os
-import time
+﻿import streamlit as st
 import pandas as pd
 import numpy as np
-import xgboost as xgb
-import streamlit as st
 from datetime import datetime, timedelta
+from pathlib import Path
+import xgboost as xgb
 
-# -------------------------------------------------------------
+# ---------------------------------------------
 # CONFIG
-# -------------------------------------------------------------
-st.set_page_config(
-    page_title="DJBets NFL Predictor v9.5-S",
-    page_icon="🏈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---------------------------------------------
+st.set_page_config(page_title="DJBets NFL Predictor", page_icon="🏈", layout="wide")
 
-# Custom CSS for dark modern theme
-st.markdown("""
-    <style>
-        body {
-            background-color: #0E1117;
-            color: #FAFAFA;
-        }
-        .stApp {
-            background-color: #0E1117;
-        }
-        .block-container {
-            padding-top: 2rem;
-        }
-        h1, h2, h3 {
-            color: #00BFFF !important;
-        }
-        .game-card {
-            background-color: #1E222A;
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 15px;
-            box-shadow: 0px 0px 8px rgba(0, 0, 0, 0.5);
-        }
-    </style>
-""", unsafe_allow_html=True)
+DATA_DIR = Path("data")
+HIST_PATTERN = "historical*.csv"
+SCHED_PATTERN = "schedule_*.csv"
 
-# -------------------------------------------------------------
-# MOCK DATA GENERATION
-# -------------------------------------------------------------
-TEAMS = [
-    "Kansas City Chiefs", "Buffalo Bills", "Philadelphia Eagles", "Dallas Cowboys",
-    "San Francisco 49ers", "Miami Dolphins", "Baltimore Ravens", "Detroit Lions"
-]
+# ---------------------------------------------
+# LOAD DATA (ALWAYS PICK LATEST)
+# ---------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_latest_schedule():
+    files = sorted(DATA_DIR.glob(SCHED_PATTERN))
+    if not files:
+        st.error("No schedule file found in /data.")
+        st.stop()
+    latest = files[-1]
+    df = pd.read_csv(latest)
+    df["kickoff_et"] = pd.to_datetime(df["kickoff_et"])
+    st.session_state["active_schedule_file"] = latest.name
+    st.session_state["season"] = int(latest.stem.split("_")[-1])
+    return df
 
-LOGOS = {
-    "Kansas City Chiefs": "https://a.espncdn.com/i/teamlogos/nfl/500/kc.png",
-    "Buffalo Bills": "https://a.espncdn.com/i/teamlogos/nfl/500/buf.png",
-    "Philadelphia Eagles": "https://a.espncdn.com/i/teamlogos/nfl/500/phi.png",
-    "Dallas Cowboys": "https://a.espncdn.com/i/teamlogos/nfl/500/dal.png",
-    "San Francisco 49ers": "https://a.espncdn.com/i/teamlogos/nfl/500/sf.png",
-    "Miami Dolphins": "https://a.espncdn.com/i/teamlogos/nfl/500/mia.png",
-    "Baltimore Ravens": "https://a.espncdn.com/i/teamlogos/nfl/500/bal.png",
-    "Detroit Lions": "https://a.espncdn.com/i/teamlogos/nfl/500/det.png",
+@st.cache_data(show_spinner=False)
+def load_latest_history():
+    files = sorted(DATA_DIR.glob(HIST_PATTERN))
+    if not files:
+        st.error("No historical data file found in /data.")
+        st.stop()
+    latest = files[-1]
+    df = pd.read_csv(latest)
+    st.session_state["active_historical_file"] = latest.name
+    return df
+
+# ---------------------------------------------
+# MODEL TRAINING
+# ---------------------------------------------
+@st.cache_resource
+def train_model(df: pd.DataFrame):
+    X = df[["elo_diff", "temp_c", "wind_kph", "precip_prob"]]
+    y = df["home_win"]
+    model = xgb.XGBClassifier(
+        n_estimators=350, max_depth=4, learning_rate=0.08,
+        subsample=0.9, colsample_bytree=0.85, reg_lambda=1.0,
+        eval_metric="logloss", tree_method="hist"
+    )
+    model.fit(X, y)
+    return model
+
+# ---------------------------------------------
+# FEATURE SIMULATION (for demo)
+# ---------------------------------------------
+CLIMATE = {
+    "ARI":"warm","ATL":"warm","BAL":"cold","BUF":"cold","CAR":"mild","CHI":"cold","CIN":"cold","CLE":"cold",
+    "DAL":"warm","DEN":"cold","DET":"dome","GB":"cold","HOU":"dome","IND":"dome","JAX":"warm","KC":"cold",
+    "LV":"dome","LAC":"mild","LAR":"mild","MIA":"warm","MIN":"dome","NE":"cold","NO":"dome","NYG":"cold",
+    "NYJ":"cold","PHI":"cold","PIT":"cold","SF":"mild","SEA":"mild","TB":"warm","TEN":"mild","WAS":"cold"
 }
 
-def generate_mock_games(week: int):
-    np.random.seed(week)
-    games = []
-    for i in range(4):
-        home, away = np.random.choice(TEAMS, 2, replace=False)
-        kickoff = datetime.now() + timedelta(days=np.random.randint(1, 7))
-        spread = round(np.random.uniform(-7, 7), 1)
-        games.append({
-            "week": week,
-            "home_team": home,
-            "away_team": away,
-            "elo_diff": np.random.randn(),
-            "inj_diff": np.random.randn(),
-            "temp_c": np.random.uniform(-5, 25),
-            "wind_kph": np.random.uniform(0, 40),
-            "precip_prob": np.random.uniform(0, 1),
-            "spread": spread,
-            "kickoff": kickoff
-        })
-    return pd.DataFrame(games)
+def simulate_features(df):
+    out = []
+    rng = np.random.default_rng(100 + int(df["week"].iloc[0]))
+    for _, r in df.iterrows():
+        clim = CLIMATE.get(r["home_team"], "mild")
+        month = r["kickoff_et"].month
+        if clim == "dome":
+            temp_c, wind, precip = 21, 0, 0
+        else:
+            base = {"warm":26,"mild":17,"cold":7}.get("cold" if month in [12,1] else clim, 17)
+            temp_c = int(np.clip(rng.normal(base,4), -5, 30))
+            wind = int(np.clip(rng.normal(10,4), 0, 35))
+            precip = int(np.clip(rng.normal(25,15), 0, 100))
+        elo_diff = int(np.clip(rng.normal(0, 100), -200, 200))
+        out.append({**r.to_dict(), "elo_diff":elo_diff, "temp_c":temp_c, "wind_kph":wind, "precip_prob":precip})
+    return pd.DataFrame(out)
 
-# -------------------------------------------------------------
-# MODEL LOADING / TRAINING
-# -------------------------------------------------------------
-model_path = "model.xgb"
-model = xgb.XGBClassifier()
+def nice_kick(dt: datetime)->str:
+    try:
+        return dt.strftime("%a, %b %-d • %-I:%M %p ET")
+    except:
+        return dt.strftime("%a, %b %d • %I:%M %p ET")
 
-if not os.path.exists(model_path):
-    with st.spinner("Training model for the first time..."):
-        df = generate_mock_games(1)
-        X = df[["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]]
-        y = np.random.randint(0, 2, len(df))
-        model.fit(X, y)
-        model.save_model(model_path)
-        time.sleep(1)
-        st.success("✅ Model trained and saved!")
-else:
-    model.load_model(model_path)
+# ---------------------------------------------
+# APP LAYOUT
+# ---------------------------------------------
+st.title("🏈 DJBets NFL Predictor — Live Auto Git Mode")
 
-# -------------------------------------------------------------
-# UI: MAIN APP
-# -------------------------------------------------------------
-st.title("🏈 DJBets NFL Predictor v9.5-S")
-st.caption("Smart predictions powered by XGBoost — with mock ESPN-style data.")
+sched = load_latest_schedule()
+hist = load_latest_history()
+season = st.session_state["season"]
+weeks = sorted(sched["week"].unique())
+wk = st.sidebar.selectbox("Week", weeks, index=min(len(weeks)-1, 0))
+slots = st.sidebar.multiselect("Slots", ["TNF","SUN-1","SUN-2","SNF","MNF"], default=[])
 
-# Week selector
-week = st.selectbox("Select Week", [1, 2, 3, 4, 5, 6, 7, 8])
+df_week = sched[(sched["season"]==season) & (sched["week"]==wk)].copy()
+if slots:
+    df_week = df_week[df_week["network_slot"].isin(slots)]
 
-games_df = generate_mock_games(week)
-X_pred = games_df[["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]]
-probs = model.predict_proba(X_pred)[:, 1]
+if df_week.empty:
+    st.warning("No games found for this week.")
+    st.stop()
 
-games_df["home_win_prob"] = probs
-games_df["predicted_winner"] = np.where(probs >= 0.5, games_df["home_team"], games_df["away_team"])
+model = train_model(hist)
+feats = simulate_features(df_week)
+probs = model.predict_proba(feats[["elo_diff","temp_c","wind_kph","precip_prob"]])[:,1]
+feats["home_win_prob"] = probs
+feats["predicted_winner"] = np.where(probs>=0.5, feats["home_team"], feats["away_team"])
 
-# -------------------------------------------------------------
-# UI: DISPLAY GAMES
-# -------------------------------------------------------------
-st.subheader(f"📅 Week {week} Matchups & Predictions")
+# ---------------------------------------------
+# DISPLAY
+# ---------------------------------------------
+st.markdown(f"### Season {season} • Week {wk}")
+st.progress(float(feats["home_win_prob"].mean()))
 
-for _, g in games_df.iterrows():
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.markdown(f"""
-        <div class='game-card'>
-            <h3>{g['away_team']} @ {g['home_team']}</h3>
-            <p><b>Kickoff:</b> {g['kickoff'].strftime('%A, %b %d %I:%M %p')}</p>
-            <p><b>Spread:</b> {g['spread']} pts</p>
-            <p><b>Predicted Winner:</b> {g['predicted_winner']}</p>
-            <p><b>Home Win Probability:</b> {round(g['home_win_prob']*100,1)}%</p>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.image(LOGOS.get(g["home_team"], ""), width=80)
-        st.image(LOGOS.get(g["away_team"], ""), width=80)
+for _, row in feats.iterrows():
+    st.markdown(f"**{row['away_team']} @ {row['home_team']}** — {nice_kick(row['kickoff_et'])}")
+    st.caption(f"Win %: {row['home_win_prob']*100:.1f}% | Predicted: {row['predicted_winner']}")
+    st.divider()
 
-# -------------------------------------------------------------
-# OPTIONAL: Game Detail Viewer
-# -------------------------------------------------------------
-st.markdown("---")
-selected_team = st.selectbox("🔍 View Analysis for Team", TEAMS)
-st.write(f"### {selected_team} — Analytical Summary")
-
-st.write("""
-- **Current Form:** Improving (last 3 games trending up)
-- **Defensive Style:** Mix of Cover-2 zone and man coverage
-- **Key Factors:**
-  - Injuries minimal
-  - Weather impact negligible
-  - QB performance stable
-- **Betting Insights:** Model sees slight value on teams with home ELO edge > +0.5σ
-""")
-
-st.info("📊 Tip: Once you integrate real ESPN APIs, this analysis section will auto-populate with real stats, spreads, and performance data.")
+st.caption(f"🔄 Data: {st.session_state['active_schedule_file']} | History: {st.session_state['active_historical_file']} | Updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
