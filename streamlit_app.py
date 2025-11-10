@@ -108,12 +108,13 @@ def load_or_train_model(hist):
     model = xgb.XGBClassifier(n_estimators=120, max_depth=4, learning_rate=0.08)
     features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
 
-    hist["elo_diff"] = hist.get("elo_diff", pd.Series(np.random.uniform(-100, 100, len(hist))))
-    hist["inj_diff"] = hist.get("inj_diff", pd.Series(np.random.uniform(-1, 1, len(hist))))
-    hist["temp_c"] = hist.get("temp_c", pd.Series(np.random.uniform(-5, 25, len(hist))))
-    hist["home_win"] = (hist["home_score"] > hist["away_score"]).astype(int)
+    # Ensure all expected columns exist
+    for f in features:
+        if f not in hist.columns:
+            hist[f] = np.random.uniform(0, 1, len(hist))
+            st.warning(f"⚠️ Added missing feature column: {f}")
 
-    hist = hist.dropna(subset=features)
+    hist["home_win"] = (hist["home_score"] > hist["away_score"]).astype(int)
     X = hist[features]
     y = hist["home_win"]
 
@@ -153,7 +154,11 @@ def compute_model_record(hist, model):
         completed = hist.dropna(subset=["home_score", "away_score"])
         if completed.empty:
             return 0, 0, 0.0
-        X = completed[["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]]
+        features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
+        for f in features:
+            if f not in completed.columns:
+                completed[f] = np.random.uniform(0, 1, len(completed))
+        X = completed[features]
         y_true = (completed["home_score"] > completed["away_score"]).astype(int)
         y_pred = model.predict(X)
         correct = sum(y_true == y_pred)
@@ -176,7 +181,13 @@ if week_df.empty:
     st.warning("⚠️ No games found for this week.")
     st.stop()
 
+# Ensure feature columns exist for prediction
 features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
+for f in features:
+    if f not in week_df.columns:
+        week_df[f] = np.random.uniform(0, 1, len(week_df))
+        st.warning(f"⚠️ Missing column {f}, added placeholder values.")
+
 week_df["home_win_prob_model"] = model.predict_proba(week_df[features])[:, 1]
 
 st.markdown(f"### 🗓️ {season} Week {week}")
