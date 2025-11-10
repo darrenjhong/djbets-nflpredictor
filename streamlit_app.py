@@ -1,5 +1,5 @@
-﻿# DJBets NFL Predictor v10.5
-# Adds: clear home/away layout, completed game results, spread & O/U prediction, deep-dive analysis.
+﻿# DJBets NFL Predictor v10.6
+# Fixes: robust spread parsing, game state differentiation, final vs upcoming display
 
 import os
 import numpy as np
@@ -22,14 +22,10 @@ MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "temp_c", "wind_kph", "precip_prob"]
 
 TEAMS = [
-    "BUF", "MIA", "NE", "NYJ",
-    "BAL", "CIN", "CLE", "PIT",
-    "HOU", "IND", "JAX", "TEN",
-    "DEN", "KC", "LV", "LAC",
-    "DAL", "NYG", "PHI", "WAS",
-    "CHI", "DET", "GB", "MIN",
-    "ATL", "CAR", "NO", "TB",
-    "ARI", "LAR", "SF", "SEA"
+    "BUF", "MIA", "NE", "NYJ", "BAL", "CIN", "CLE", "PIT",
+    "HOU", "IND", "JAX", "TEN", "DEN", "KC", "LV", "LAC",
+    "DAL", "NYG", "PHI", "WAS", "CHI", "DET", "GB", "MIN",
+    "ATL", "CAR", "NO", "TB", "ARI", "LAR", "SF", "SEA"
 ]
 
 # --------------------------------------------------------------
@@ -42,7 +38,6 @@ def load_or_train_model():
         model.load_model(MODEL_FILE)
         return model
 
-    # train simple mock model
     np.random.seed(42)
     df = pd.DataFrame({
         "elo_diff": np.random.normal(0, 100, 500),
@@ -60,7 +55,7 @@ def load_or_train_model():
     return model
 
 # --------------------------------------------------------------
-# 🏈 ESPN Scraper (with filler)
+# 🏈 ESPN Scraper (robust with state detection)
 # --------------------------------------------------------------
 @st.cache_data(ttl=604800)
 def fetch_schedule(season: int):
@@ -81,6 +76,9 @@ def fetch_schedule(season: int):
 
             home, away, home_logo, away_logo = "TBD", "TBD", "", ""
             home_score, away_score = np.nan, np.nan
+            state = ev.get("status", {}).get("type", {}).get("state", "pre")
+            short_detail = ev.get("status", {}).get("type", {}).get("shortDetail", "")
+
             for team in comp["competitors"]:
                 t = team.get("team", {})
                 abbr = t.get("abbreviation", "")
@@ -108,6 +106,8 @@ def fetch_schedule(season: int):
                 "over_under": over_under,
                 "home_score": pd.to_numeric(home_score, errors="coerce"),
                 "away_score": pd.to_numeric(away_score, errors="coerce"),
+                "state": state,
+                "status_text": short_detail
             })
 
     df = pd.DataFrame(games)
@@ -135,7 +135,9 @@ def generate_mock_schedule(season: int):
                 "spread": f"-{np.random.randint(1,8)}",
                 "over_under": np.random.randint(38, 55),
                 "home_score": np.nan,
-                "away_score": np.nan
+                "away_score": np.nan,
+                "state": "pre",
+                "status_text": "Scheduled"
             })
     return pd.DataFrame(rows)
 
@@ -181,48 +183,71 @@ week_df["predicted_spread"] = np.round(-7 * (week_df["home_win_prob"] - 0.5), 1)
 week_df["predicted_total"] = np.round(45 + np.random.normal(0, 3, len(week_df)), 1)
 
 # --------------------------------------------------------------
+# 🧮 Helper - Robust spread parser
+# --------------------------------------------------------------
+def parse_spread(value):
+    if not isinstance(value, str) or value in ["N/A", "", None]:
+        return np.nan
+    try:
+        # Remove team names and symbols, keep numeric part
+        num = ''.join(ch for ch in value if ch in "+-.0123456789")
+        if num == "" or num == ".":
+            return np.nan
+        return float(num)
+    except Exception:
+        return np.nan
+
+# --------------------------------------------------------------
 # 🎯 Display Game Cards
 # --------------------------------------------------------------
 for _, row in week_df.iterrows():
-    # layout
+    vegas_spread = parse_spread(row["spread"])
     bg = "rgba(0, 150, 0, 0.1)" if row["home_win_prob"] > 0.55 else "rgba(150, 0, 0, 0.1)"
-    st.markdown(f'<div style="background-color:{bg}; padding: 1rem; border-radius: 1rem;">', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 3, 1])
 
-    with col1:
+    state = row.get("state", "pre")
+    state_color = {"pre": "🟡 Upcoming", "in": "🟢 Live", "post": "🔵 Final"}.get(state, "⚪ Unknown")
+
+    st.markdown(f'<div style="background-color:{bg}; padding: 1rem; border-radius: 1rem;">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 3, 1])
+
+    with c1:
         st.image(row["away_logo"], width=60)
         st.markdown(f"**{row['away_team']}**")
 
-    with col3:
+    with c3:
         st.image(row["home_logo"], width=60)
         st.markdown(f"**{row['home_team']}**")
 
-    with col2:
+    with c2:
         kickoff = row["kickoff_et"].strftime("%a %b %d, %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
+        st.markdown(f"**{state_color}** — {row['status_text']}")
         st.markdown(f"**Kickoff:** {kickoff}")
         st.markdown(f"**Spread:** {row['spread']}  |  **Model Spread:** {row['predicted_spread']:+.1f}")
         st.markdown(f"**Over/Under:** {row['over_under']}  |  **Model Total:** {row['predicted_total']}")
         st.progress(row["home_win_prob"], text=f"🏠 Home win probability: {row['home_win_prob']*100:.1f}%")
 
-        # Completed game check
-        if not np.isnan(row["home_score"]) and not np.isnan(row["away_score"]):
+        # Only show final score if completed
+        if state == "post" and not np.isnan(row["home_score"]) and not np.isnan(row["away_score"]):
             actual_winner = "home" if row["home_score"] > row["away_score"] else "away"
             predicted_winner = "home" if row["home_win_prob"] >= 0.5 else "away"
             correct = (actual_winner == predicted_winner)
             result = "✅ Correct prediction" if correct else "❌ Incorrect"
             st.markdown(f"**Final:** {row['away_score']} - {row['home_score']} ({result})")
+        elif state == "in":
+            st.markdown(f"**Live:** {row['status_text']}")
+        else:
+            st.markdown("⏳ **Not started yet**")
 
-        # Deep-dive analysis
         with st.expander("📊 Detailed Analysis"):
-            # Spread Recommendation
-            vegas_spread = 0 if row["spread"] == "N/A" else float(str(row["spread"]).replace("+","").replace("−","-").replace("-",""))
-            spread_diff = row["predicted_spread"] - vegas_spread
-            spread_recommendation = (
-                f"Bet **{row['home_team']}** (model expects stronger performance)" if spread_diff < 0
-                else f"Bet **{row['away_team']}** (+points value)"
-            )
+            if not np.isnan(vegas_spread):
+                spread_diff = row["predicted_spread"] - vegas_spread
+                spread_recommendation = (
+                    f"Bet **{row['home_team']}** (model expects stronger performance)"
+                    if spread_diff < 0 else f"Bet **{row['away_team']}** (+points value)"
+                )
+            else:
+                spread_recommendation = "No Vegas spread available"
 
-            # O/U Recommendation
             if not np.isnan(row["over_under"]):
                 ou_diff = row["predicted_total"] - row["over_under"]
                 ou_recommendation = "Bet **Over**" if ou_diff > 0 else "Bet **Under**"
@@ -232,7 +257,6 @@ for _, row in week_df.iterrows():
             st.markdown(f"**Spread Recommendation:** {spread_recommendation}")
             st.markdown(f"**Over/Under Recommendation:** {ou_recommendation}")
 
-            # Visual feature chart
             feats = {k: row[k] for k in MODEL_FEATURES}
             fig, ax = plt.subplots(figsize=(5, 2))
             ax.bar(feats.keys(), feats.values(), color="skyblue")
@@ -240,7 +264,8 @@ for _, row in week_df.iterrows():
             st.pyplot(fig)
 
             st.caption(f"Predicted Home Win Prob: {row['home_win_prob']*100:.1f}%")
+
     st.markdown("</div><br>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("🏈 DJBets NFL Predictor v10.5 — with spread, O/U, results, and deep-dive analysis.")
+st.caption("🏈 DJBets NFL Predictor v10.6 — live status, final results, spread/O-U analysis.")
