@@ -220,6 +220,17 @@ st.sidebar.caption("Bars represent **blended home win probability**")
 # --------------------------------------------------------------
 st.title(f"🏈 DJBets NFL Predictor — Week {week} ({season})")
 
+def safe_prob(val):
+    """Ensure probability is a float between 0 and 1."""
+    try:
+        v = float(val)
+        if np.isnan(v):
+            return 0.5   # fallback neutral
+        return min(max(v, 0.0), 1.0)
+    except Exception:
+        return 0.5
+
+
 for _, row in week_df.iterrows():
     prob = row["blended_prob_home"]
     color = "🟩 Home Favored" if prob > 0.55 else ("🟥 Away Favored" if prob < 0.45 else "🟨 Even")
@@ -245,7 +256,9 @@ for _, row in week_df.iterrows():
         st.markdown(f"**{row['home_team']}**")
 
     with col2:
-        st.progress(prob, text=f"Home Win Probability: {prob*100:.1f}%")
+        prob_clamped = safe_prob(prob)
+        st.progress(prob_clamped, text=f"Home Win Probability: {prob_clamped*100:.1f}%")
+
         st.markdown(f"Spread: {row['spread']} | O/U: {row['over_under']}")
 
         if state == "post" and not np.isnan(row["home_score"]) and not np.isnan(row["away_score"]):
