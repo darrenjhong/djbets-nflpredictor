@@ -1,9 +1,8 @@
-﻿# streamlit_app.py — DJBets NFL Predictor v10.5
-# Adds: Tracker charts (ROI + accuracy by week/team) + logo fix + ROI persistence
+﻿# streamlit_app.py — DJBets NFL Predictor v10.6
+# Fixes: Tracker persistence, logo pathing, spread recommendations, robust CSV
 
 import os
 import io
-import base64
 import numpy as np
 import pandas as pd
 import requests
@@ -11,32 +10,32 @@ import xgboost as xgb
 import streamlit as st
 import matplotlib.pyplot as plt
 from datetime import datetime
+from pathlib import Path
 from PIL import Image
 
 # --------------------------------------------------------------
-# ⚙️ App Setup
+# ⚙️ Setup
 st.set_page_config(page_title="DJBets NFL Predictor", page_icon="🏈", layout="wide")
-DATA_DIR = "data"
-LOGO_DIR = "logos"
-MODEL_FILE = os.path.join(DATA_DIR, "model.json")
-os.makedirs(DATA_DIR, exist_ok=True)
+
+ROOT_DIR = Path(__file__).parent
+DATA_DIR = ROOT_DIR / "data"
+LOGO_DIR = ROOT_DIR / "logos"
+MODEL_FILE = DATA_DIR / "model.json"
+DATA_DIR.mkdir(exist_ok=True)
 MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]
 
 # --------------------------------------------------------------
-# 🧠 Utility: load logo safely (works on Streamlit Cloud)
-def load_logo_base64(team_abbr):
-    paths = [
-        f"{LOGO_DIR}/{team_abbr}.png",
-        f"./{LOGO_DIR}/{team_abbr}.png",
-        f"public/logos/{team_abbr}.png",
-    ]
-    for path in paths:
-        if os.path.exists(path):
+# 🖼️ Logo Loader (Works in Streamlit Cloud)
+def load_logo(team_abbr):
+    for path in [
+        LOGO_DIR / f"{team_abbr}.png",
+        ROOT_DIR / f"logos/{team_abbr}.png",
+        Path.cwd() / f"logos/{team_abbr}.png",
+    ]:
+        if path.exists():
             try:
-                with open(path, "rb") as f:
-                    encoded = base64.b64encode(f.read()).decode()
-                    return f"data:image/png;base64,{encoded}"
+                return Image.open(path)
             except Exception:
                 continue
     return None
@@ -57,16 +56,16 @@ def train_fresh_model():
     y = (np.random.uniform(0, 1, 1000) < p).astype(int)
     model = xgb.XGBClassifier(n_estimators=250, max_depth=3, learning_rate=0.07)
     model.fit(df[MODEL_FEATURES], y)
-    model.save_model(MODEL_FILE)
+    model.save_model(str(MODEL_FILE))
     return model
 
 @st.cache_resource
 def load_or_train_model():
-    if not os.path.exists(MODEL_FILE):
+    if not MODEL_FILE.exists():
         return train_fresh_model()
     try:
         model = xgb.XGBClassifier()
-        model.load_model(MODEL_FILE)
+        model.load_model(str(MODEL_FILE))
         return model
     except Exception:
         return train_fresh_model()
@@ -88,6 +87,9 @@ def fetch_schedule_espn(season, week):
         if not home or not away:
             continue
         state = comp.get("status", {}).get("type", {}).get("name", "").lower()
+        odds = comp.get("odds", [{}])[0] if comp.get("odds") else {}
+        spread = odds.get("spread", np.nan)
+        ou = odds.get("overUnder", np.nan)
         games.append({
             "season": season,
             "week": week,
@@ -99,6 +101,8 @@ def fetch_schedule_espn(season, week):
             "away_score": int(away.get("score", 0)),
             "kickoff_et": comp.get("date"),
             "state": state,
+            "spread": spread,
+            "over_under": ou,
         })
     df = pd.DataFrame(games)
     df["kickoff_et"] = pd.to_datetime(df["kickoff_et"], errors="coerce")
@@ -143,19 +147,96 @@ sched["blended_prob_home"] = (1 - alpha) * sched["home_win_prob_model"] + alpha 
 sched["edge_pp"] = (sched["blended_prob_home"] - sched["market_prob_home"]) * 100
 
 # --------------------------------------------------------------
+# 🧾 Predictor Tab
+if tab == "Predictor":
+    st.title(f"🏈 DJBets NFL Predictor — {season} Week {week}")
+
+    history_records = []
+    for _, row in sched.iterrows():
+        kickoff = row["kickoff_et"].strftime("%a %b %d %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
+        prob = row["blended_prob_home"]
+
+        if "final" in row["state"]:
+            home_win = row["home_score"] > row["away_score"]
+            model_home = row["blended_prob_home"] > 0.5
+            result_tag = "✅ Correct" if home_win == model_home else "❌ Wrong"
+            correct = int(home_win == model_home)
+            pnl = 1 if correct else -1
+        else:
+            result_tag, correct, pnl = "⏳ Pending", np.nan, 0
+
+        home_logo = load_logo(row["home_abbr"])
+        away_logo = load_logo(row["away_abbr"])
+
+        cols = st.columns([1, 3, 1])
+        with cols[0]:
+            if away_logo: st.image(away_logo, width=70)
+            else: st.write(row["away_abbr"])
+        with cols[1]:
+            st.markdown(f"### {row['away_team']} @ {row['home_team']} ({result_tag})")
+            st.caption(f"Kickoff: {kickoff}")
+        with cols[2]:
+            if home_logo: st.image(home_logo, width=70)
+            else: st.write(row["home_abbr"])
+
+        if "final" in row["state"]:
+            st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']}")
+        else:
+            st.markdown("⏳ **Not Started**")
+
+        conf = "🟢 High" if abs(row["edge_pp"]) > 5 else "🟡 Medium" if abs(row["edge_pp"]) > 2 else "🔴 Low"
+        st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}% ({conf})")
+
+        # Spread recommendation
+        spread = row.get("spread", np.nan)
+        try:
+            spread_val = float(str(spread).replace("+", "").replace("−", "-"))
+        except:
+            spread_val = 0.0
+
+        if row["edge_pp"] > edge_thresh:
+            rec = f"🏠 Bet Home ({spread_val:+.1f})"
+        elif row["edge_pp"] < -edge_thresh:
+            rec = f"🛫 Bet Away ({-spread_val:+.1f})"
+        else:
+            rec = "🚫 No Bet"
+
+        st.markdown(f"**Edge:** {row['edge_pp']:+.2f} pp | **Spread:** {spread} | **Recommendation:** {rec}")
+
+        history_records.append({
+            "season": season,
+            "week": week,
+            "home": row["home_team"],
+            "away": row["away_team"],
+            "pred_prob_home": prob,
+            "result": result_tag,
+            "correct": correct,
+            "pnl": pnl,
+        })
+
+    # Save predictions
+    hist_path = DATA_DIR / "predictions_history.csv"
+    hist_df = pd.DataFrame(history_records)
+    if hist_path.exists():
+        old = pd.read_csv(hist_path)
+        hist_df = pd.concat([old, hist_df]).drop_duplicates(subset=["season", "week", "home", "away"], keep="last")
+    hist_df.to_csv(hist_path, index=False)
+    st.caption("v10.6 — Persistent tracker + logos + spread-aware recs")
+
+# --------------------------------------------------------------
 # 📊 Tracker Tab
-if tab == "Model Tracker":
+else:
     st.title("📈 Model Tracker — Performance Overview")
-    hist_path = os.path.join(DATA_DIR, "predictions_history.csv")
-    if not os.path.exists(hist_path):
-        st.info("No model history yet. Run some predictions first.")
+    hist_path = DATA_DIR / "predictions_history.csv"
+    if not hist_path.exists():
+        st.info("No history yet. Run predictions first.")
         st.stop()
 
     hist = pd.read_csv(hist_path)
+    hist = hist.dropna(subset=["week"])
     st.dataframe(hist, use_container_width=True)
     st.download_button("⬇️ Export CSV", hist.to_csv(index=False).encode(), "model_tracker.csv", "text/csv")
 
-    # Accuracy by week
     acc_week = hist.dropna(subset=["correct"]).groupby("week")["correct"].mean() * 100
     pnl_week = hist.groupby("week")["pnl"].sum()
 
@@ -170,7 +251,6 @@ if tab == "Model Tracker":
     ax1.set_title("Weekly Model Performance")
     st.pyplot(fig)
 
-    # ROI by team
     st.markdown("### 🏈 ROI by Team")
     team_roi = hist.groupby("home")["pnl"].sum().sort_values(ascending=False)
     fig, ax = plt.subplots(figsize=(7, 3))
@@ -178,78 +258,3 @@ if tab == "Model Tracker":
     ax.set_ylabel("P&L (units)")
     ax.set_title("Cumulative ROI by Team")
     st.pyplot(fig)
-    st.stop()
-
-# --------------------------------------------------------------
-# 🧾 Predictor Tab
-st.title(f"🏈 DJBets NFL Predictor — {season} Week {week}")
-
-history_records = []
-for _, row in sched.iterrows():
-    kickoff = row["kickoff_et"].strftime("%a %b %d %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
-    prob = row["blended_prob_home"]
-
-    if "final" in row["state"]:
-        home_win = row["home_score"] > row["away_score"]
-        model_home = row["blended_prob_home"] > 0.5
-        result_tag = "✅ Correct" if home_win == model_home else "❌ Wrong"
-        correct = int(home_win == model_home)
-        pnl = 1 if correct else -1
-    else:
-        result_tag, correct, pnl = "⏳ Pending", np.nan, 0
-
-    home_logo_b64 = load_logo_base64(row["home_abbr"])
-    away_logo_b64 = load_logo_base64(row["away_abbr"])
-
-    cols = st.columns([1, 3, 1])
-    with cols[0]:
-        if away_logo_b64:
-            st.markdown(f'<img src="{away_logo_b64}" width="70">', unsafe_allow_html=True)
-        else:
-            st.write(row["away_abbr"])
-    with cols[1]:
-        st.markdown(f"### {row['away_team']} @ {row['home_team']} ({result_tag})")
-        st.caption(f"Kickoff: {kickoff}")
-    with cols[2]:
-        if home_logo_b64:
-            st.markdown(f'<img src="{home_logo_b64}" width="70">', unsafe_allow_html=True)
-        else:
-            st.write(row["home_abbr"])
-
-    if "final" in row["state"]:
-        st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']}")
-    else:
-        st.markdown("⏳ **Not Started**")
-
-    conf = "🟢 High" if abs(row["edge_pp"]) > 5 else "🟡 Medium" if abs(row["edge_pp"]) > 2 else "🔴 Low"
-    st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}% ({conf})")
-
-    if row["edge_pp"] > edge_thresh:
-        rec = "🏠 Bet Home"
-    elif row["edge_pp"] < -edge_thresh:
-        rec = "🛫 Bet Away"
-    else:
-        rec = "🚫 No Bet"
-
-    st.markdown(f"**Edge:** {row['edge_pp']:+.2f} pp | **Recommendation:** {rec}")
-
-    history_records.append({
-        "season": season,
-        "week": week,
-        "home": row["home_team"],
-        "away": row["away_team"],
-        "pred_prob_home": prob,
-        "result": result_tag,
-        "correct": correct,
-        "pnl": pnl,
-    })
-
-# Save history for Tracker tab
-hist_path = os.path.join(DATA_DIR, "predictions_history.csv")
-hist_df = pd.DataFrame(history_records)
-if os.path.exists(hist_path):
-    old = pd.read_csv(hist_path)
-    hist_df = pd.concat([old, hist_df]).drop_duplicates(subset=["season","week","home","away"], keep="last")
-hist_df.to_csv(hist_path, index=False)
-
-st.caption("v10.5 — Tracker Charts + ROI + Logos + Correctness Highlighting")
