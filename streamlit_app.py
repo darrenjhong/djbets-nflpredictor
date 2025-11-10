@@ -1,7 +1,8 @@
-﻿# streamlit_app.py — DJBets NFL Predictor v10.2
-# Adds Expected Value (EV), color-coded confidence, edge meter, and visual polish.
+﻿# streamlit_app.py — DJBets NFL Predictor v10.3.2
+# Adds: Safe logo loading via PIL, team betting history, ROI tracking, confidence display
 
 import os
+import io
 import numpy as np
 import pandas as pd
 import requests
@@ -9,9 +10,10 @@ import xgboost as xgb
 import streamlit as st
 import matplotlib.pyplot as plt
 from datetime import datetime
+from PIL import Image
 
 # --------------------------------------------------------------
-# 🧩 Setup
+# ⚙️ Setup
 st.set_page_config(page_title="DJBets NFL Predictor", page_icon="🏈", layout="wide")
 DATA_DIR = "data"
 LOGO_DIR = "logos"
@@ -30,7 +32,7 @@ except Exception:
     ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 # --------------------------------------------------------------
-# 🔧 Feature Simulation
+# 🧠 Feature Simulation
 def simulate_features(df, week):
     np.random.seed(week)
     df["elo_home"] = np.random.normal(1550, 100, len(df))
@@ -76,7 +78,7 @@ def load_or_train_model():
         return train_fresh_model()
 
 # --------------------------------------------------------------
-# 🏈 ESPN Schedule
+# 🏈 ESPN Schedule Fetch
 @st.cache_data(ttl=3600)
 def fetch_schedule_espn(season, week):
     url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}&week={week}"
@@ -135,9 +137,27 @@ def merge_odds(df):
         return df
 
 # --------------------------------------------------------------
-# 🧮 ROI & Accuracy
+# 🖼️ Logo Loader (works on Streamlit Cloud)
+def load_logo(team_abbr):
+    possible_paths = [
+        f"{LOGO_DIR}/{team_abbr}.png",
+        f"./{LOGO_DIR}/{team_abbr}.png",
+        f"public/logos/{team_abbr}.png",
+    ]
+    for path in possible_paths:
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    return Image.open(io.BytesIO(f.read()))
+        except Exception:
+            continue
+    return None
+
+# --------------------------------------------------------------
+# 🧮 Performance
 def compute_performance(df):
     correct, total, pnl, bets = 0, 0, 0.0, 0
+    team_stats = {}
     for _, r in df.iterrows():
         if "final" not in r["state"]:
             continue
@@ -145,15 +165,20 @@ def compute_performance(df):
         home_win = r["home_score"] > r["away_score"]
         model_home = r["blended_prob_home"] > 0.5
         correct += home_win == model_home
-
         edge = r.get("edge_pp", np.nan)
         if np.isnan(edge) or abs(edge) < 3:
             continue
         bets += 1
         pnl += 1 if home_win == (edge > 0) else -1
+        for team in [r["home_abbr"], r["away_abbr"]]:
+            if team not in team_stats:
+                team_stats[team] = {"correct": 0, "total": 0}
+            team_stats[team]["total"] += 1
+            if (team == r["home_abbr"] and home_win == model_home) or (team == r["away_abbr"] and home_win != model_home):
+                team_stats[team]["correct"] += 1
     acc = (correct / total * 100) if total else 0
     roi = (pnl / bets * 100) if bets else 0
-    return correct, total, round(acc, 1), round(pnl, 2), bets, round(roi, 1)
+    return correct, total, round(acc, 1), round(pnl, 2), bets, round(roi, 1), team_stats
 
 # --------------------------------------------------------------
 # 🎛️ Sidebar
@@ -179,12 +204,12 @@ sched["home_win_prob_model"] = model.predict_proba(X)[:, 1]
 sched["market_prob_home"] = 1 / (1 + np.exp(-0.2 * sched["spread"].fillna(0)))
 sched["blended_prob_home"] = (1 - alpha) * sched["home_win_prob_model"] + alpha * sched["market_prob_home"]
 sched["edge_pp"] = (sched["blended_prob_home"] - sched["market_prob_home"]) * 100
-sched["ev"] = (sched["home_win_prob_model"] - sched["market_prob_home"]) * 100  # expected value
+sched["ev"] = (sched["home_win_prob_model"] - sched["market_prob_home"]) * 100
 
 sched["spread"] = sched["spread"].apply(lambda x: "N/A" if pd.isna(x) else x)
 sched["over_under"] = sched["over_under"].apply(lambda x: "N/A" if pd.isna(x) else x)
 
-correct, total, acc, pnl, bets, roi = compute_performance(sched)
+correct, total, acc, pnl, bets, roi, team_stats = compute_performance(sched)
 
 # --------------------------------------------------------------
 # 📈 Sidebar Metrics
@@ -201,7 +226,6 @@ for _, row in sched.iterrows():
     kickoff = row["kickoff_et"].strftime("%a %b %d %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
     prob = row["blended_prob_home"]
 
-    # ✅ Status label
     if "final" in row["state"]:
         home_win = row["home_score"] > row["away_score"]
         model_pick = row["blended_prob_home"] > 0.5
@@ -211,36 +235,24 @@ for _, row in sched.iterrows():
     else:
         result_tag = "⏳ Pending"
 
-    # 🖼️ Logos
-    # 🖼️ Safe logo path for Streamlit Cloud
-    def get_logo_path(abbr):
-        """Return a working path for the team logo (supports local & Streamlit Cloud)."""
-        possible_paths = [
-            f"logos/{abbr}.png",              # ✅ for Streamlit Cloud
-            f"./logos/{abbr}.png",            # ✅ fallback for local dev
-            f"public/logos/{abbr}.png",       # legacy path
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        return None
-
-    home_logo = get_logo_path(row["home_abbr"])
-    away_logo = get_logo_path(row["away_abbr"])
+    home_logo = load_logo(row["home_abbr"])
+    away_logo = load_logo(row["away_abbr"])
 
     cols = st.columns([1, 3, 1])
     with cols[0]:
         if away_logo:
             st.image(away_logo, width=70)
+        else:
+            st.write(row["away_abbr"])
     with cols[1]:
         st.markdown(f"### {row['away_team']} @ {row['home_team']} ({result_tag})")
         st.caption(f"Kickoff: {kickoff}")
     with cols[2]:
         if home_logo:
             st.image(home_logo, width=70)
+        else:
+            st.write(row["home_abbr"])
 
-
-    # 🏆 Score
     if "final" in row["state"]:
         st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']}")
     elif "in" in row["state"]:
@@ -248,21 +260,12 @@ for _, row in sched.iterrows():
     else:
         st.markdown("⏳ **Not Started**")
 
-    # 🎯 Confidence Color
     ev = row["ev"]
-    if ev > 5:
-        conf_color = "🟢 High"
-    elif ev > 1:
-        conf_color = "🟡 Medium"
-    else:
-        conf_color = "🔴 Low"
+    conf = "🟢 High" if ev > 5 else "🟡 Medium" if ev > 1 else "🔴 Low"
 
-    # 📊 Edge Meter
-    st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}% ({conf_color})")
-
+    st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}% ({conf})")
     st.markdown(f"**Edge:** {row['edge_pp']:+.2f} pp | **EV:** {ev:+.2f}% | **Spread:** {row['spread']} | **O/U:** {row['over_under']}")
 
-    # Recommendation
     if row["edge_pp"] > edge_thresh:
         rec = "🏠 Bet Home"
     elif row["edge_pp"] < -edge_thresh:
@@ -271,10 +274,9 @@ for _, row in sched.iterrows():
         rec = "🚫 No Bet"
     st.markdown(f"**Recommendation:** {rec}")
 
-    # 📈 Expandable Breakdown
     with st.expander("📊 Detailed Betting Breakdown"):
         fig, ax = plt.subplots(figsize=(4, 1.5))
-        ax.bar(["Model", "Market"], [row["home_win_prob_model"]*100, row["market_prob_home"]*100])
+        ax.bar(["Model", "Market"], [row["home_win_prob_model"]*100, row["market_prob_home"]*100], color=["#4CAF50", "#FFC107"])
         ax.set_ylim(0, 100)
         ax.set_ylabel("% Home Win Prob")
         ax.set_title("Model vs Market")
@@ -282,9 +284,17 @@ for _, row in sched.iterrows():
 
         st.markdown(f"**Model Win Prob:** {row['home_win_prob_model']*100:.1f}%")
         st.markdown(f"**Market Win Prob:** {row['market_prob_home']*100:.1f}%")
-        st.markdown(f"**Expected Value (EV):** {ev:+.2f}% ({conf_color})")
+        st.markdown(f"**Expected Value (EV):** {ev:+.2f}% ({conf})")
         st.markdown(f"**Blended Probability:** {row['blended_prob_home']*100:.1f}%")
         st.markdown(f"**ELO (H-A):** {row['elo_home']:.0f} - {row['elo_away']:.0f}")
         st.markdown(f"**Weather:** {row['temp_c']:.1f}°C, {row['wind_kph']:.1f} kph, {row['precip_prob']*100:.1f}% rain chance")
 
-st.caption("v10.2 — Expected Value + Confidence Levels + Visual Edge Meter")
+        for team_label, team_abbr in [("Home", row["home_abbr"]), ("Away", row["away_abbr"])]:
+            record = team_stats.get(team_abbr, {"correct": 0, "total": 0})
+            if record["total"] > 0:
+                pct = record["correct"] / record["total"] * 100
+                st.markdown(f"**{team_label} Team Record:** {record['correct']}-{record['total'] - record['correct']} ({pct:.1f}%)")
+            else:
+                st.markdown(f"**{team_label} Team Record:** No data yet")
+
+st.caption("v10.3.2 — Safe Logos + Team-Based Record + Confidence + ROI")
