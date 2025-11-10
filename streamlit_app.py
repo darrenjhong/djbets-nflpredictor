@@ -53,6 +53,7 @@ def load_or_train_model():
 # --------------------------------------------------------------
 @st.cache_data(ttl=604800)
 def fetch_schedule(season: int):
+    """Fetch the NFL schedule + betting data from ESPN."""
     games = []
     for week in range(1, MAX_WEEKS + 1):
         url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}&seasontype=2&week={week}"
@@ -83,10 +84,17 @@ def fetch_schedule(season: int):
                 else:
                     away, away_logo, away_score = abbr, logo, score
 
-            odds = (comp.get("odds") or [{}])[0]
-            spread = odds.get("details", "N/A")
-            over_under = odds.get("overUnder", np.nan)
+            # Defensive odds extraction
+            odds_data = (comp.get("odds") or [{}])[0]
+            spread = odds_data.get("details", "").strip() or "Even"
+            over_under = odds_data.get("overUnder", np.nan)
             kickoff = comp.get("date", None)
+
+            # Clean up spread text
+            if spread in ("", "N/A", "NA", None):
+                spread = "Even"
+            if "Pick" in spread or "even" in spread.lower():
+                spread = "Even"
 
             games.append({
                 "season": season,
@@ -101,57 +109,13 @@ def fetch_schedule(season: int):
                 "home_score": pd.to_numeric(home_score, errors="coerce"),
                 "away_score": pd.to_numeric(away_score, errors="coerce"),
                 "state": state,
-                "status_text": short_detail
+                "status_text": short_detail,
             })
 
     df = pd.DataFrame(games)
     df.to_csv(SCHEDULE_FILE, index=False)
     return df
 
-# --------------------------------------------------------------
-# 🔧 Helper Functions
-# --------------------------------------------------------------
-def simulate_features(df, week=1):
-    np.random.seed(week * 123)
-    df["elo_diff"] = np.random.normal(0, 100, len(df))
-    df["temp_c"] = np.random.uniform(-5, 25, len(df))
-    df["wind_kph"] = np.random.uniform(0, 25, len(df))
-    df["precip_prob"] = np.random.uniform(0, 1, len(df))
-    df["over_under"] = df["over_under"].fillna(
-        np.clip(45 + (df["elo_diff"]/100)*2 + np.random.normal(0, 2, len(df)), 37, 56)
-    ).round(1)
-    return df
-
-def compute_roi(df):
-    """Compute simulated ROI for all completed games with edge predictions."""
-    if "edge_pp" not in df.columns:
-        return 0.0, 0, 0.0
-
-    df = df.copy()
-    df["edge_pp"] = pd.to_numeric(df["edge_pp"], errors="coerce")
-
-    stake = 1.0
-    pnl, bets = 0.0, 0
-
-    for _, r in df.iterrows():
-        edge_val = r.get("edge_pp", np.nan)
-        if pd.isna(edge_val) or abs(edge_val) < 3:
-            continue
-
-        pick_home = edge_val > 0
-        home_score = r.get("home_score", np.nan)
-        away_score = r.get("away_score", np.nan)
-
-        if pd.isna(home_score) or pd.isna(away_score):
-            continue
-
-        home_win = home_score > away_score
-        win = (pick_home == home_win)
-        pnl += (0.91 if win else -1.0)
-        bets += 1
-
-    roi = pnl / max(bets, 1)
-    return pnl, bets, roi
 
 # --------------------------------------------------------------
 # 🎛️ Sidebar Controls
@@ -191,9 +155,15 @@ week_df = simulate_features(week_df, week)
 X = week_df[MODEL_FEATURES].astype(float)
 week_df["home_win_prob_model"] = model.predict_proba(X)[:, 1]
 week_df["market_prob_home"] = week_df["spread"].apply(spread_to_home_prob)
+
+# Fill missing market probs with model probs (so they aren't NaN)
+week_df["market_prob_home"] = week_df["market_prob_home"].fillna(week_df["home_win_prob_model"])
+
 week_df["blended_prob_home"] = [
-    blend_probs(m, mk, ALPHA) for m, mk in zip(week_df["home_win_prob_model"], week_df["market_prob_home"])
+    blend_probs(m, mk, ALPHA)
+    for m, mk in zip(week_df["home_win_prob_model"], week_df["market_prob_home"])
 ]
+
 week_df["edge_pp"] = (week_df["blended_prob_home"] - week_df["market_prob_home"]) * 100
 
 # Safely merge into full schedule for ROI computation
