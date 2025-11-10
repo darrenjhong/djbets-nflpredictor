@@ -117,9 +117,10 @@ st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
 weeks = list(range(1, MAX_WEEKS + 1))
 week = st.sidebar.selectbox("Week", weeks, index=0)
+
 if st.sidebar.button("♻️ Refresh ESPN Schedule"):
     scrape_espn_schedule(season, force_refresh=True)
-    st.experimental_rerun()
+    st.rerun()  # ✅ replaces deprecated st.experimental_rerun()
 
 # --------------------------------------------------------------
 # 🔄 Load Schedule + Model
@@ -147,13 +148,13 @@ for _, row in week_df.iterrows():
     # ✅ Team Logos
     with col1:
         logo_url = row.get("away_logo", "")
-        if logo_url:
+        if isinstance(logo_url, str) and logo_url:
             st.image(logo_url, width=60)
         st.markdown(f"**{row.get('away_team', 'TBD')}**")
 
     with col3:
         logo_url = row.get("home_logo", "")
-        if logo_url:
+        if isinstance(logo_url, str) and logo_url:
             st.image(logo_url, width=60)
         st.markdown(f"**{row.get('home_team', 'TBD')}**")
 
