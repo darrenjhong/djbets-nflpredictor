@@ -23,6 +23,34 @@ MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "temp_c", "wind_kph", "precip_prob"]
 
 # --------------------------------------------------------------
+# 🧮 Simulated Feature Generator
+# --------------------------------------------------------------
+def simulate_features(df: pd.DataFrame, week: int):
+    """
+    Simulate missing numeric model features for demonstration.
+    When no DB data (ELO, injuries, weather) exist, this fills random values.
+    """
+    np.random.seed(week)  # week-based reproducibility
+
+    # Simulate ELO difference — home minus away
+    df["elo_home"] = np.random.normal(1550, 100, len(df))
+    df["elo_away"] = np.random.normal(1500, 100, len(df))
+    df["elo_diff"] = df["elo_home"] - df["elo_away"]
+
+    # Simulate injuries — positive favors home, negative hurts them
+    df["inj_diff"] = np.random.normal(0, 5, len(df))
+
+    # Simulate weather (°C, km/h, precip %)
+    df["temp_c"] = np.random.normal(10, 8, len(df))
+    df["wind_kph"] = np.random.uniform(0, 30, len(df))
+    df["precip_prob"] = np.random.uniform(0, 1, len(df))
+
+    # Model uses those fields for prediction later
+    return df
+
+
+
+# --------------------------------------------------------------
 # 🧠 Model Loader
 # --------------------------------------------------------------
 @st.cache_resource
