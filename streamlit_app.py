@@ -2,24 +2,37 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from data_fetcher import fetch_all_history
 from data_updater import refresh_data, check_last_update
-
-import schedule, time
 import threading
-
-def background_refresh():
-    schedule.every().monday.at("06:00").do(refresh_data)
-    while True:
-        schedule.run_pending()
-        time.sleep(3600)
-
-threading.Thread(target=background_refresh, daemon=True).start()
-
+import time
 
 st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
+
+# --------------------------------------------------------------
+# 🕒 Background Auto-Refresh (No external dependencies)
+# --------------------------------------------------------------
+AUTO_REFRESH_INTERVAL = timedelta(days=7)  # once a week
+
+def auto_refresh_if_needed():
+    """Automatically refresh data weekly if last update is > 7 days ago."""
+    try:
+        last_updated_str = check_last_update()
+        if last_updated_str == "Never":
+            refresh_data()
+            return
+        last_updated = datetime.strptime(last_updated_str, "%Y-%m-%d %H:%M:%S")
+        if datetime.now() - last_updated > AUTO_REFRESH_INTERVAL:
+            st.info("🕒 Auto-refresh triggered (data older than 7 days).")
+            refresh_data()
+    except Exception as e:
+        st.warning(f"⚠️ Auto-refresh skipped due to error: {e}")
+
+# Run auto-refresh check in background
+threading.Thread(target=auto_refresh_if_needed, daemon=True).start()
+
 
 # --------------------------------------------------------------
 # ⚙️ Data Handling
