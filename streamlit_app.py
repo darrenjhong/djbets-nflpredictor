@@ -195,25 +195,59 @@ week_df["recommendation"] = np.where(
 )
 
 # --------------------------------------------------------------
-# 🏈 Display
+# 🏈 Display with Safe Logo Loading & Team Names
 # --------------------------------------------------------------
+LOGO_DIR = Path(__file__).parent / "logos"
+
+TEAM_FULL_NAMES = {
+    "ARI": "Cardinals", "ATL": "Falcons", "BAL": "Ravens", "BUF": "Bills",
+    "CAR": "Panthers", "CHI": "Bears", "CIN": "Bengals", "CLE": "Browns",
+    "DAL": "Cowboys", "DEN": "Broncos", "DET": "Lions", "GB": "Packers",
+    "HOU": "Texans", "IND": "Colts", "JAX": "Jaguars", "KC": "Chiefs",
+    "LV": "Raiders", "LAC": "Chargers", "LAR": "Rams", "MIA": "Dolphins",
+    "MIN": "Vikings", "NE": "Patriots", "NO": "Saints", "NYG": "Giants",
+    "NYJ": "Jets", "PHI": "Eagles", "PIT": "Steelers", "SEA": "Seahawks",
+    "SF": "49ers", "TB": "Buccaneers", "TEN": "Titans", "WAS": "Commanders"
+}
+
+def get_logo_path(team_abbr):
+    """Find logo path based on full team name, fallback to placeholder."""
+    full_name = TEAM_FULL_NAMES.get(team_abbr, team_abbr).lower().replace(" ", "")
+    logo_file = LOGO_DIR / f"{full_name}.png"
+    if logo_file.exists():
+        return str(logo_file)
+    else:
+        return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
+
+# Display each matchup
 for _, row in week_df.iterrows():
     home, away = row["home_team"], row["away_team"]
-    spread, ou, prob, rec = row["spread"], row["over_under"], row["home_win_prob_model"] * 100, row["recommendation"]
-    home_logo, away_logo = f"logos/{home}.png", f"logos/{away}.png"
+    spread, ou = row["spread"], row["over_under"]
+    prob, rec = row["home_win_prob_model"] * 100, row["recommendation"]
+
+    home_logo = get_logo_path(home)
+    away_logo = get_logo_path(away)
+    home_name = TEAM_FULL_NAMES.get(home, home)
+    away_name = TEAM_FULL_NAMES.get(away, away)
 
     col1, col2, col3 = st.columns([2, 1, 2])
     with col1:
         st.image(away_logo, width=80)
-        st.markdown(f"**{away}**")
+        st.markdown(f"**{away_name}**")
     with col2:
         st.markdown(
-            f"**Spread:** {spread:.1f}<br>**O/U:** {ou:.1f}<br>**Home Win Prob:** {prob:.1f}%<br>**{rec}**",
+            f"""
+            **Spread:** {spread:.1f}  
+            **O/U:** {ou:.1f}  
+            **Home Win Prob:** {prob:.1f}%  
+            **{rec}**
+            """,
             unsafe_allow_html=True,
         )
     with col3:
         st.image(home_logo, width=80)
-        st.markdown(f"**{home}**")
+        st.markdown(f"**{home_name}**")
+
 
 # --------------------------------------------------------------
 # 📊 Model Tracker
