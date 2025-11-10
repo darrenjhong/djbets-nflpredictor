@@ -14,7 +14,6 @@ st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
 
 DATA_DIR = Path(__file__).parent / "data"
 LOGO_DIR = Path(__file__).parent / "logos"
-MODEL_PATH = DATA_DIR / "xgb_model.json"
 
 # --------------------------------------------------------------
 # 🏈 Team Names and Logos
@@ -73,8 +72,8 @@ def fetch_all_history():
                 "home_team": home_team,
                 "away_score": away_score,
                 "home_score": home_score,
-                "spread": float(spread.replace("PK", "0")) if spread.replace(".", "").replace("-", "").isdigit() else np.nan,
-                "over_under": float(over_under) if over_under.replace(".", "").isdigit() else np.nan
+                "spread": pd.to_numeric(spread.replace("PK", "0"), errors="coerce"),
+                "over_under": pd.to_numeric(over_under, errors="coerce")
             })
     df = pd.DataFrame(games)
     if df.empty:
@@ -108,15 +107,20 @@ def load_or_train_model(hist):
     model = xgb.XGBClassifier(n_estimators=120, max_depth=4, learning_rate=0.08)
     features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
 
-    # Ensure all expected columns exist
+    # Add missing numeric columns safely
     for f in features:
         if f not in hist.columns:
-            hist[f] = np.random.uniform(0, 1, len(hist))
             st.warning(f"⚠️ Added missing feature column: {f}")
+            hist[f] = np.random.uniform(-1, 1, len(hist))
 
+    # Fill NaNs and coerce all features to float
+    for f in features:
+        hist[f] = pd.to_numeric(hist[f], errors="coerce").fillna(np.random.uniform(-1, 1))
+
+    # Simulate environment and random features if missing
     hist["home_win"] = (hist["home_score"] > hist["away_score"]).astype(int)
-    X = hist[features]
-    y = hist["home_win"]
+    X = hist[features].astype(float)
+    y = hist["home_win"].astype(int)
 
     if len(X) < 10:
         st.warning("⚠️ Not enough valid data — using simulated training set.")
@@ -128,6 +132,9 @@ def load_or_train_model(hist):
             "inj_diff": np.random.uniform(-1, 1, 100)
         })
         y = np.random.choice([0, 1], 100)
+
+    # Final safety check: no NaNs
+    X = X.replace([np.inf, -np.inf], 0).fillna(0)
 
     model.fit(X, y)
     return model
@@ -158,7 +165,8 @@ def compute_model_record(hist, model):
         for f in features:
             if f not in completed.columns:
                 completed[f] = np.random.uniform(0, 1, len(completed))
-        X = completed[features]
+            completed[f] = pd.to_numeric(completed[f], errors="coerce").fillna(0)
+        X = completed[features].astype(float)
         y_true = (completed["home_score"] > completed["away_score"]).astype(int)
         y_pred = model.predict(X)
         correct = sum(y_true == y_pred)
@@ -181,14 +189,13 @@ if week_df.empty:
     st.warning("⚠️ No games found for this week.")
     st.stop()
 
-# Ensure feature columns exist for prediction
 features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
 for f in features:
     if f not in week_df.columns:
         week_df[f] = np.random.uniform(0, 1, len(week_df))
-        st.warning(f"⚠️ Missing column {f}, added placeholder values.")
+    week_df[f] = pd.to_numeric(week_df[f], errors="coerce").fillna(0)
 
-week_df["home_win_prob_model"] = model.predict_proba(week_df[features])[:, 1]
+week_df["home_win_prob_model"] = model.predict_proba(week_df[features].astype(float))[:, 1]
 
 st.markdown(f"### 🗓️ {season} Week {week}")
 
