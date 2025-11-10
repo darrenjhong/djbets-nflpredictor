@@ -88,8 +88,9 @@ def fetch_all_history():
             "season": [2025]*3
         })
     else:
-        df["spread"].fillna(np.random.uniform(-6, 6, len(df)), inplace=True)
-        df["over_under"].fillna(np.random.uniform(38, 55, len(df)), inplace=True)
+        # Properly assign random realistic fallbacks row-by-row
+        df["spread"] = df["spread"].fillna(pd.Series(np.random.uniform(-6, 6, len(df))))
+        df["over_under"] = df["over_under"].fillna(pd.Series(np.random.uniform(38, 55, len(df))))
         df["elo_diff"] = np.random.uniform(-100, 100, len(df))
         df["inj_diff"] = np.random.uniform(-1, 1, len(df))
         df["temp_c"] = np.random.uniform(-5, 25, len(df))
