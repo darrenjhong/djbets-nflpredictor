@@ -168,6 +168,70 @@ if st.sidebar.button("♻️ Refresh Data"):
     st.rerun()
 
 # --------------------------------------------------------------
+# 💰 ROI / Profit & Loss Calculation
+# --------------------------------------------------------------
+import numpy as np
+
+def compute_roi(df: pd.DataFrame, bet_unit: float = 100.0):
+    """
+    Simulate a basic betting ROI strategy.
+    For each completed game:
+      - Bet on the team with the model's recommendation ("Bet Home" or "Bet Away")
+      - Uses American odds derived from market probability (approximation)
+      - Calculates total PnL and ROI
+    """
+
+    pnl = 0.0
+    bets = 0
+
+    for _, row in df.iterrows():
+        if row.get("state") != "post":  # only include completed games
+            continue
+
+        # skip invalid or missing edges
+        edge = row.get("edge_pp")
+        if edge is None or np.isnan(edge):
+            continue
+
+        # require meaningful advantage to place a "bet"
+        if abs(edge) < 3:
+            continue
+
+        rec = row.get("recommendation", "🚫 No Bet")
+        model_home_win = row.get("home_win_prob_model", 0.5)
+
+        # approximate fair American odds
+        def implied_odds(p):
+            if p <= 0 or np.isnan(p): 
+                return 0
+            if p > 0.5:
+                return -round(100 * p / (1 - p))
+            else:
+                return round(100 * (1 - p) / p)
+
+        # approximate market odds based on market probability
+        market_prob = row.get("market_prob_home", np.nan)
+        odds = implied_odds(market_prob if not np.isnan(market_prob) else model_home_win)
+
+        # check winner
+        if pd.isna(row["home_score"]) or pd.isna(row["away_score"]):
+            continue
+        home_won = row["home_score"] > row["away_score"]
+
+        # determine bet and outcome
+        if "Home" in rec:
+            bets += 1
+            pnl += bet_unit * (100 / abs(odds)) if home_won else -bet_unit
+        elif "Away" in rec:
+            bets += 1
+            pnl += bet_unit * (100 / abs(odds)) if not home_won else -bet_unit
+
+    roi = (pnl / (bets * bet_unit)) * 100 if bets > 0 else 0.0
+    return round(pnl, 2), bets, round(roi, 2)
+
+
+
+# --------------------------------------------------------------
 # 📊 Load Data
 # --------------------------------------------------------------
 model = load_or_train_model()
