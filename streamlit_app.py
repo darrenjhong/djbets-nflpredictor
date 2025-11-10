@@ -1,5 +1,5 @@
-﻿# streamlit_app.py — DJBets NFL Predictor v9.6-safe-fixed
-# With safe XGBoost predict handling, caching, and quota control.
+﻿# streamlit_app.py — DJBets NFL Predictor v9.6-safe-auto-retrain
+# Automatically retrains XGBoost if feature shape mismatch occurs.
 
 import os
 import numpy as np
@@ -20,7 +20,7 @@ MODEL_FILE = os.path.join(DATA_DIR, "model.json")
 MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]
 
-# Secure API key handling
+# Load API key
 try:
     ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 except Exception:
@@ -29,7 +29,7 @@ except Exception:
     ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 # --------------------------------------------------------------
-# 🧮 Generate synthetic features
+# 🧮 Simulated features
 def simulate_features(df: pd.DataFrame, week: int):
     np.random.seed(week)
     df["elo_home"] = np.random.normal(1550, 100, len(df))
@@ -42,29 +42,40 @@ def simulate_features(df: pd.DataFrame, week: int):
     return df
 
 # --------------------------------------------------------------
-# 🧠 Model loading/training
-@st.cache_resource
-def load_or_train_model():
-    if os.path.exists(MODEL_FILE):
-        model = xgb.XGBClassifier()
-        model.load_model(MODEL_FILE)
-        return model
-
+# 🧠 Model loading/training with schema check
+def train_fresh_model():
     np.random.seed(42)
     df = pd.DataFrame({
-        "elo_diff": np.random.normal(0, 100, 800),
-        "inj_diff": np.random.normal(0, 10, 800),
-        "temp_c": np.random.uniform(-5, 25, 800),
-        "wind_kph": np.random.uniform(0, 25, 800),
-        "precip_prob": np.random.uniform(0, 1, 800),
+        "elo_diff": np.random.normal(0, 100, 1000),
+        "inj_diff": np.random.normal(0, 10, 1000),
+        "temp_c": np.random.uniform(-5, 25, 1000),
+        "wind_kph": np.random.uniform(0, 25, 1000),
+        "precip_prob": np.random.uniform(0, 1, 1000),
     })
-    logits = 0.018 * df["elo_diff"] + 0.02 * df["inj_diff"] - 0.05 * df["precip_prob"]
+    logits = 0.02 * df["elo_diff"] + 0.01 * df["inj_diff"] - 0.04 * df["precip_prob"]
     p = 1 / (1 + np.exp(-logits))
-    y = (np.random.uniform(0, 1, 800) < p).astype(int)
-    model = xgb.XGBClassifier(n_estimators=200, max_depth=3, learning_rate=0.07)
+    y = (np.random.uniform(0, 1, 1000) < p).astype(int)
+    model = xgb.XGBClassifier(n_estimators=250, max_depth=3, learning_rate=0.07)
     model.fit(df[MODEL_FEATURES].values, y.values)
     model.save_model(MODEL_FILE)
     return model
+
+@st.cache_resource
+def load_or_train_model():
+    if not os.path.exists(MODEL_FILE):
+        return train_fresh_model()
+    try:
+        model = xgb.XGBClassifier()
+        model.load_model(MODEL_FILE)
+        booster = model.get_booster()
+        expected_features = len(booster.feature_names) if booster.feature_names else None
+        if expected_features and expected_features != len(MODEL_FEATURES):
+            st.warning(f"🔄 Retraining model: expected {expected_features} features, now {len(MODEL_FEATURES)}")
+            return train_fresh_model()
+        return model
+    except Exception as e:
+        st.error(f"⚠️ Model load failed, retraining: {e}")
+        return train_fresh_model()
 
 # --------------------------------------------------------------
 # 📊 Odds + Schedule Loader with Cache + CSV Backup
@@ -145,9 +156,9 @@ st.sidebar.header("🏈 DJBets NFL Predictor")
 season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
 week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS + 1)), index=0)
 ALPHA = st.sidebar.slider("Market Weight (α)", 0.0, 1.0, 0.6, 0.05,
-                          help="Higher = trust market odds more than the model.")
+                          help="Higher = trust market odds more than model.")
 edge_thresh = st.sidebar.slider("Bet Threshold (pp)", 0.0, 10.0, 3.0, 0.5,
-                                help="Minimum edge in percentage points to place a bet.")
+                                help="Minimum edge before betting.")
 if st.sidebar.button("♻️ Force Refresh"):
     fetch_schedule_and_odds.clear()
     st.experimental_rerun()
@@ -165,7 +176,7 @@ sched["kickoff_et"] = pd.to_datetime(sched["kickoff_et"], errors="coerce")
 sched = simulate_features(sched, week)
 
 # --------------------------------------------------------------
-# ✅ Safe prediction block
+# ✅ Predict safely
 for f in MODEL_FEATURES:
     if f not in sched.columns:
         sched[f] = 0.0
@@ -173,9 +184,13 @@ X = sched[MODEL_FEATURES].fillna(0).astype(float)
 
 try:
     sched["home_win_prob_model"] = model.predict_proba(X.values)[:, 1]
-except Exception as e:
-    st.error(f"⚠️ Model prediction failed: {e}")
-    sched["home_win_prob_model"] = 0.5
+except ValueError as e:
+    if "feature shape" in str(e).lower():
+        st.warning("🔄 Retraining model due to feature shape mismatch.")
+        model = train_fresh_model()
+        sched["home_win_prob_model"] = model.predict_proba(X.values)[:, 1]
+    else:
+        raise e
 
 sched["market_prob_home"] = sched["spread"].apply(spread_to_home_prob)
 sched["blended_prob_home"] = [
@@ -205,23 +220,21 @@ for _, row in sched.iterrows():
     st.caption(f"Kickoff: {row['kickoff_et']:%a %b %d, %I:%M %p}" if pd.notna(row["kickoff_et"]) else "TBD")
     st.markdown(f"{color} | {edge_txt}")
 
-    col1, col2 = st.columns([1,3])
-    with col2:
-        st.progress(prob, text=f"Home Win Probability: {prob*100:.1f}%")
-        st.markdown(f"Spread: {row['spread']} | O/U: {row['over_under']}")
-        st.markdown(f"**Model Probability:** {row['home_win_prob_model']*100:.1f}%")
-        st.markdown(f"**Market Probability:** {row['market_prob_home']*100:.1f}%")
-        st.markdown(f"**Blended Probability:** {prob*100:.1f}%")
+    st.progress(prob, text=f"Home Win Probability: {prob*100:.1f}%")
+    st.markdown(f"Spread: {row['spread']} | O/U: {row['over_under']}")
+    st.markdown(f"**Model Probability:** {row['home_win_prob_model']*100:.1f}%")
+    st.markdown(f"**Market Probability:** {row['market_prob_home']*100:.1f}%")
+    st.markdown(f"**Blended Probability:** {prob*100:.1f}%")
 
-        rec = ("🏠 Bet Home" if row["edge_pp"] > edge_thresh else
-               "🛫 Bet Away" if row["edge_pp"] < -edge_thresh else
-               "🚫 No Bet")
-        st.markdown(f"**Recommendation:** {rec}")
+    rec = ("🏠 Bet Home" if row["edge_pp"] > edge_thresh else
+           "🛫 Bet Away" if row["edge_pp"] < -edge_thresh else
+           "🚫 No Bet")
+    st.markdown(f"**Recommendation:** {rec}")
 
-        if row["state"] == "post":
-            st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']}")
-        else:
-            st.markdown("⏳ Game not started")
+    if row["state"] == "post":
+        st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']}")
+    else:
+        st.markdown("⏳ Game not started")
 
 st.markdown("---")
-st.caption("🏈 DJBets NFL Predictor — v9.6-safe-fixed (with quota, caching, & feature validation)")
+st.caption("🏈 DJBets NFL Predictor — v9.6 auto-retrain (safe & quota-aware)")
