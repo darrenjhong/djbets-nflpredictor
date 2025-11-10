@@ -1,5 +1,5 @@
-﻿# streamlit_app.py — DJBets NFL Predictor v10.8
-# Fixes: logo mapping (using lowercase team names), graceful fallback to /public/logos
+﻿# streamlit_app.py — DJBets NFL Predictor v10.8b
+# Fix: over_under fillna TypeError + stable logo mapping + clean predictions
 
 import os
 import numpy as np
@@ -107,9 +107,7 @@ def simulate_features(df, week):
 # --------------------------------------------------------------
 # 🧾 Logo Finder (matches abbreviation or team nickname)
 def get_logo_path(team_name, team_abbr):
-    """
-    Try to match logo files by either abbreviation (BUF.png) or nickname (bills.png).
-    """
+    """Try to match logo files by either abbreviation (BUF.png) or nickname (bills.png)."""
     candidates = [
         LOGO_DIR / f"{team_abbr.lower()}.png",
         LOGO_DIR / f"{team_name.split()[-1].lower()}.png",
@@ -138,10 +136,15 @@ if sched.empty:
     st.warning("No games found for this week.")
     st.stop()
 
-# Fill missing spreads if not provided
-sched["spread"] = sched["spread"].fillna(sched["elo_diff"] / 25).astype(float)
-sched["over_under"] = sched["over_under"].fillna(np.random.uniform(40, 48, len(sched)))
+# Fill missing spreads and O/U correctly
+sched["spread"] = sched["spread"].fillna(sched["elo_diff"] / 25)
+if "over_under" not in sched.columns:
+    sched["over_under"] = np.nan
+mask = sched["over_under"].isna()
+sched.loc[mask, "over_under"] = np.random.uniform(40, 48, mask.sum())
 
+# --------------------------------------------------------------
+# 🔢 Predictions
 X = sched[MODEL_FEATURES].fillna(0).astype(float)
 sched["home_win_prob_model"] = model.predict_proba(X)[:, 1]
 sched["market_prob_home"] = 1 / (1 + np.exp(-0.2 * sched["elo_diff"]))
@@ -221,7 +224,7 @@ if tab == "Predictor":
         old = pd.read_csv(hist_path)
         hist_df = pd.concat([old, hist_df]).drop_duplicates(subset=["season", "week", "home", "away"], keep="last")
     hist_df.to_csv(hist_path, index=False)
-    st.caption("v10.8 — Logo name fix + spread handling")
+    st.caption("v10.8b — Fixed fillna error + logo mapping")
 
 # --------------------------------------------------------------
 # 📈 Model Tracker Tab
