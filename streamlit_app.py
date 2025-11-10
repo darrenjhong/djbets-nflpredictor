@@ -18,45 +18,83 @@ MAX_WEEKS = 18
 # --------------------------------------------------------------
 # 🏈 ESPN Scraper for Schedule
 # --------------------------------------------------------------
-def scrape_espn_schedule(season: int):
-    """Scrape live NFL schedule from ESPN."""
-    url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}&seasontype=2"
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    data = resp.json()
+from datetime import datetime, timedelta
 
-    games = []
-    for ev in data.get("events", []):
-        comp = ev.get("competitions", [{}])[0]
-        if not comp.get("competitors"):
-            continue
-        home, away = None, None
-        home_logo, away_logo = None, None
-        for team in comp["competitors"]:
-            if team["homeAway"] == "home":
-                home = team["team"]["abbreviation"]
-                home_logo = team["team"].get("logo")
-            else:
-                away = team["team"]["abbreviation"]
-                away_logo = team["team"].get("logo")
+def scrape_espn_schedule(season: int, force_refresh: bool = False):
+    """
+    Scrape full NFL season (weeks 1–18) from ESPN, auto-refresh weekly.
+    If a local schedule.csv exists and is less than 7 days old, skip re-fetch.
+    """
 
-        odds = comp.get("odds", [{}])[0] if comp.get("odds") else {}
-        spread = odds.get("details", "N/A")
-
-        games.append({
-            "season": season,
-            "week": ev.get("week", {}).get("number"),
-            "home_team": home,
-            "away_team": away,
-            "kickoff_et": comp.get("date"),
-            "spread": spread,
-            "home_logo": home_logo,
-            "away_logo": away_logo
-        })
-
-    df = pd.DataFrame(games)
     os.makedirs(DATA_DIR, exist_ok=True)
-    df.to_csv(SCHEDULE_FILE, index=False)
+
+    # ----------------------------------------------------------
+    # 🧭 Step 1: Check if schedule exists and is fresh
+    # ----------------------------------------------------------
+    if os.path.exists(SCHEDULE_FILE) and not force_refresh:
+        file_age_days = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(SCHEDULE_FILE))).days
+        if file_age_days < 7:
+            st.info(f"📁 Using cached schedule (last updated {file_age_days} days ago).")
+            return pd.read_csv(SCHEDULE_FILE)
+
+    # ----------------------------------------------------------
+    # 🏈 Step 2: Fetch from ESPN if missing or stale
+    # ----------------------------------------------------------
+    st.warning("♻️ Schedule missing or outdated — fetching from ESPN...")
+
+    all_games = []
+    for week in range(1, 19):
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?"
+            f"year={season}&seasontype=2&week={week}"
+        )
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            st.warning(f"Week {week} fetch failed: {e}")
+            continue
+
+        for ev in data.get("events", []):
+            comp = ev.get("competitions", [{}])[0]
+            if not comp.get("competitors"):
+                continue
+
+            home, away, home_logo, away_logo = None, None, None, None
+            for team in comp["competitors"]:
+                if team["homeAway"] == "home":
+                    home = team["team"]["abbreviation"]
+                    home_logo = team["team"].get("logo")
+                else:
+                    away = team["team"]["abbreviation"]
+                    away_logo = team["team"].get("logo")
+
+            odds = comp.get("odds", [{}])[0] if comp.get("odds") else {}
+            spread = odds.get("details", "N/A")
+
+            all_games.append({
+                "season": season,
+                "week": week,
+                "home_team": home,
+                "away_team": away,
+                "kickoff_et": comp.get("date"),
+                "spread": spread,
+                "home_logo": home_logo,
+                "away_logo": away_logo
+            })
+
+    # ----------------------------------------------------------
+    # 💾 Step 3: Save to CSV
+    # ----------------------------------------------------------
+    df = pd.DataFrame(all_games)
+    if not df.empty:
+        df.to_csv(SCHEDULE_FILE, index=False)
+        st.success(f"✅ ESPN schedule updated ({len(df)} games total).")
+    else:
+        st.error("❌ ESPN returned no schedule data.")
     return df
+
 
 
 # --------------------------------------------------------------
@@ -134,6 +172,11 @@ if st.sidebar.button("🔄 Retrain model now"):
     st.cache_resource.clear()
     st.cache_data.clear()
     st.experimental_rerun()
+
+if st.sidebar.button("♻️ Refresh ESPN Schedule"):
+    with st.spinner("Refreshing schedule from ESPN..."):
+        scrape_espn_schedule(season, force_refresh=True)
+        st.experimental_rerun()
 
 
 # --------------------------------------------------------------
