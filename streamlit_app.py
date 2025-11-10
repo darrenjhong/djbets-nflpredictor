@@ -14,7 +14,7 @@ from datetime import datetime
 # 🧩 Setup
 st.set_page_config(page_title="DJBets NFL Predictor", page_icon="🏈", layout="wide")
 DATA_DIR = "data"
-LOGO_DIR = "public/logos"
+LOGO_DIR = "logos"
 os.makedirs(DATA_DIR, exist_ok=True)
 MODEL_FILE = os.path.join(DATA_DIR, "model.json")
 MAX_WEEKS = 18
@@ -212,19 +212,33 @@ for _, row in sched.iterrows():
         result_tag = "⏳ Pending"
 
     # 🖼️ Logos
-    home_logo = f"{LOGO_DIR}/{row['home_abbr']}.png"
-    away_logo = f"{LOGO_DIR}/{row['away_abbr']}.png"
+    # 🖼️ Safe logo path for Streamlit Cloud
+    def get_logo_path(abbr):
+        """Return a working path for the team logo (supports local & Streamlit Cloud)."""
+        possible_paths = [
+            f"logos/{abbr}.png",              # ✅ for Streamlit Cloud
+            f"./logos/{abbr}.png",            # ✅ fallback for local dev
+            f"public/logos/{abbr}.png",       # legacy path
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        return None
+
+    home_logo = get_logo_path(row["home_abbr"])
+    away_logo = get_logo_path(row["away_abbr"])
 
     cols = st.columns([1, 3, 1])
     with cols[0]:
-        if os.path.exists(away_logo):
+        if away_logo:
             st.image(away_logo, width=70)
     with cols[1]:
         st.markdown(f"### {row['away_team']} @ {row['home_team']} ({result_tag})")
         st.caption(f"Kickoff: {kickoff}")
     with cols[2]:
-        if os.path.exists(home_logo):
+        if home_logo:
             st.image(home_logo, width=70)
+
 
     # 🏆 Score
     if "final" in row["state"]:
