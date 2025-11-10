@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
-import json
 
 # --------------------------------------------------------------
 # 🏗️ Page Config
@@ -149,18 +148,21 @@ season = st.sidebar.selectbox("Season", seasons, index=0)
 weeks = sorted(hist["week"].unique())
 week = st.sidebar.selectbox("Week", weeks, index=min(len(weeks)-1, 0))
 
-@st.cache_data(show_spinner=False)
 def compute_model_record(hist, model):
-    completed = hist.dropna(subset=["home_score", "away_score"])
-    if completed.empty:
+    try:
+        completed = hist.dropna(subset=["home_score", "away_score"])
+        if completed.empty:
+            return 0, 0, 0.0
+        X = completed[["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]]
+        y_true = (completed["home_score"] > completed["away_score"]).astype(int)
+        y_pred = model.predict(X)
+        correct = sum(y_true == y_pred)
+        total = len(y_true)
+        pct = (correct / total * 100) if total > 0 else 0
+        return correct, total - correct, pct
+    except Exception as e:
+        st.warning(f"⚠️ Could not compute model record: {e}")
         return 0, 0, 0.0
-    X = completed[["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]]
-    y_true = (completed["home_score"] > completed["away_score"]).astype(int)
-    y_pred = model.predict(X)
-    correct = sum(y_true == y_pred)
-    total = len(y_true)
-    pct = (correct / total * 100) if total > 0 else 0
-    return correct, total - correct, pct
 
 correct, incorrect, pct = compute_model_record(hist, model)
 st.sidebar.markdown(f"**Model Record:** {correct}-{incorrect} ({pct:.1f}%)")
