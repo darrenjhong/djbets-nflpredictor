@@ -1,4 +1,5 @@
-﻿# streamlit_app.py — DJBets NFL Predictor v9.9 (ESPN schedule + correctness tracking)
+﻿# streamlit_app.py — DJBets NFL Predictor v10.2
+# Adds Expected Value (EV), color-coded confidence, edge meter, and visual polish.
 
 import os
 import numpy as np
@@ -6,18 +7,21 @@ import pandas as pd
 import requests
 import xgboost as xgb
 import streamlit as st
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 # --------------------------------------------------------------
-# ⚙️ Setup
+# 🧩 Setup
 st.set_page_config(page_title="DJBets NFL Predictor", page_icon="🏈", layout="wide")
 DATA_DIR = "data"
+LOGO_DIR = "public/logos"
 os.makedirs(DATA_DIR, exist_ok=True)
 MODEL_FILE = os.path.join(DATA_DIR, "model.json")
 MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]
 
-# Load Odds API Key (optional)
+# --------------------------------------------------------------
+# 🔑 API Keys
 try:
     ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 except Exception:
@@ -39,7 +43,7 @@ def simulate_features(df, week):
     return df
 
 # --------------------------------------------------------------
-# 🧠 Model Loader / Trainer
+# 🧠 Model Handling
 def train_fresh_model():
     np.random.seed(42)
     df = pd.DataFrame({
@@ -66,21 +70,18 @@ def load_or_train_model():
         model.load_model(MODEL_FILE)
         expected = len(model.get_booster().feature_names or [])
         if expected != len(MODEL_FEATURES):
-            st.warning("Retraining model (feature mismatch).")
             return train_fresh_model()
         return model
     except Exception:
-        st.warning("Model load failed — retraining.")
         return train_fresh_model()
 
 # --------------------------------------------------------------
-# 🏈 ESPN Schedule Fetcher
-@st.cache_data(ttl=3600, show_spinner="Fetching NFL schedule from ESPN...")
+# 🏈 ESPN Schedule
+@st.cache_data(ttl=3600)
 def fetch_schedule_espn(season, week):
     url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}&week={week}"
     r = requests.get(url)
     if r.status_code != 200:
-        st.error("Failed to fetch schedule from ESPN.")
         return pd.DataFrame()
 
     data = r.json()
@@ -91,16 +92,18 @@ def fetch_schedule_espn(season, week):
         away = next((c for c in comp["competitors"] if c["homeAway"] == "away"), None)
         if not home or not away:
             continue
-        status_type = comp.get("status", {}).get("type", {}).get("name", "").lower()
+        state = comp.get("status", {}).get("type", {}).get("name", "").lower()
         games.append({
             "season": season,
             "week": week,
             "home_team": home["team"]["displayName"],
             "away_team": away["team"]["displayName"],
+            "home_abbr": home["team"]["abbreviation"],
+            "away_abbr": away["team"]["abbreviation"],
             "home_score": int(home.get("score", 0)),
             "away_score": int(away.get("score", 0)),
             "kickoff_et": comp.get("date"),
-            "state": status_type,
+            "state": state,
         })
     df = pd.DataFrame(games)
     df["kickoff_et"] = pd.to_datetime(df["kickoff_et"], errors="coerce")
@@ -132,34 +135,36 @@ def merge_odds(df):
         return df
 
 # --------------------------------------------------------------
-# 💵 ROI Computation
-def compute_roi(df):
-    pnl, bets = 0.0, 0
+# 🧮 ROI & Accuracy
+def compute_performance(df):
+    correct, total, pnl, bets = 0, 0, 0.0, 0
     for _, r in df.iterrows():
         if "final" not in r["state"]:
             continue
+        total += 1
+        home_win = r["home_score"] > r["away_score"]
+        model_home = r["blended_prob_home"] > 0.5
+        correct += home_win == model_home
+
         edge = r.get("edge_pp", np.nan)
         if np.isnan(edge) or abs(edge) < 3:
             continue
         bets += 1
-        home_win = r["home_score"] > r["away_score"]
-        bet_home = edge > 0
-        pnl += 1 if home_win == bet_home else -1
+        pnl += 1 if home_win == (edge > 0) else -1
+    acc = (correct / total * 100) if total else 0
     roi = (pnl / bets * 100) if bets else 0
-    return round(pnl, 2), bets, round(roi, 1)
+    return correct, total, round(acc, 1), round(pnl, 2), bets, round(roi, 1)
 
 # --------------------------------------------------------------
 # 🎛️ Sidebar
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
 week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS + 1)), index=0)
-alpha = st.sidebar.slider("Market Weight (α)", 0.0, 1.0, 0.6, 0.05,
-    help="How much weight the model gives to market (Vegas) odds versus its own prediction.")
-edge_thresh = st.sidebar.slider("Bet Threshold (pp)", 0.0, 10.0, 3.0, 0.5,
-    help="Minimum edge (percentage points) between model and market for a bet recommendation.")
+alpha = st.sidebar.slider("Market Weight (α)", 0.0, 1.0, 0.6, 0.05)
+edge_thresh = st.sidebar.slider("Bet Threshold (pp)", 0.0, 10.0, 3.0, 0.5)
 
 # --------------------------------------------------------------
-# 🧠 Predict
+# 📊 Predict
 model = load_or_train_model()
 sched = fetch_schedule_espn(season, week)
 sched = merge_odds(sched)
@@ -174,17 +179,19 @@ sched["home_win_prob_model"] = model.predict_proba(X)[:, 1]
 sched["market_prob_home"] = 1 / (1 + np.exp(-0.2 * sched["spread"].fillna(0)))
 sched["blended_prob_home"] = (1 - alpha) * sched["home_win_prob_model"] + alpha * sched["market_prob_home"]
 sched["edge_pp"] = (sched["blended_prob_home"] - sched["market_prob_home"]) * 100
+sched["ev"] = (sched["home_win_prob_model"] - sched["market_prob_home"]) * 100  # expected value
 
-# Fill NaN spreads for display
 sched["spread"] = sched["spread"].apply(lambda x: "N/A" if pd.isna(x) else x)
 sched["over_under"] = sched["over_under"].apply(lambda x: "N/A" if pd.isna(x) else x)
 
+correct, total, acc, pnl, bets, roi = compute_performance(sched)
+
 # --------------------------------------------------------------
-# 📈 ROI
-pnl, bets, roi = compute_roi(sched)
+# 📈 Sidebar Metrics
 st.sidebar.markdown("### 📈 Model Performance")
 st.sidebar.metric("ROI", f"{roi:.1f}%", f"{pnl:+.2f} units")
 st.sidebar.metric("Bets Made", str(bets))
+st.sidebar.metric("Record", f"{correct}-{total-correct} ({acc:.1f}%)")
 
 # --------------------------------------------------------------
 # 🖥️ Main Display
@@ -193,46 +200,77 @@ st.title(f"🏈 DJBets NFL Predictor — {season} Week {week}")
 for _, row in sched.iterrows():
     kickoff = row["kickoff_et"].strftime("%a %b %d %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
     prob = row["blended_prob_home"]
-    rec = ("🏠 Bet Home" if row["edge_pp"] > edge_thresh else
-           "🛫 Bet Away" if row["edge_pp"] < -edge_thresh else
-           "🚫 No Bet")
 
-    # 🧾 Prediction correctness
-    result_tag = ""
+    # ✅ Status label
     if "final" in row["state"]:
         home_win = row["home_score"] > row["away_score"]
-        model_pick_home = row["blended_prob_home"] > 0.5
-        result_tag = "✅ Correct" if home_win == model_pick_home else "❌ Wrong"
+        model_pick = row["blended_prob_home"] > 0.5
+        result_tag = "✅ Correct" if home_win == model_pick else "❌ Wrong"
     elif "in" in row["state"]:
         result_tag = "🏈 In Progress"
     else:
         result_tag = "⏳ Pending"
 
-    st.markdown(f"### {row['away_team']} @ {row['home_team']} ({result_tag})")
-    st.caption(f"Kickoff: {kickoff}")
+    # 🖼️ Logos
+    home_logo = f"{LOGO_DIR}/{row['home_abbr']}.png"
+    away_logo = f"{LOGO_DIR}/{row['away_abbr']}.png"
 
-    # 🏁 Final or in-progress score
+    cols = st.columns([1, 3, 1])
+    with cols[0]:
+        if os.path.exists(away_logo):
+            st.image(away_logo, width=70)
+    with cols[1]:
+        st.markdown(f"### {row['away_team']} @ {row['home_team']} ({result_tag})")
+        st.caption(f"Kickoff: {kickoff}")
+    with cols[2]:
+        if os.path.exists(home_logo):
+            st.image(home_logo, width=70)
+
+    # 🏆 Score
     if "final" in row["state"]:
         st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']}")
     elif "in" in row["state"]:
         st.markdown("🏈 **In Progress**")
     else:
-        st.markdown("⏳ **Game not started**")
+        st.markdown("⏳ **Not Started**")
 
-    # 🔢 Probability Bar
-    st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}%")
+    # 🎯 Confidence Color
+    ev = row["ev"]
+    if ev > 5:
+        conf_color = "🟢 High"
+    elif ev > 1:
+        conf_color = "🟡 Medium"
+    else:
+        conf_color = "🔴 Low"
 
-    st.markdown(f"**Edge:** {row['edge_pp']:+.2f} pp | **Spread:** {row['spread']} | **O/U:** {row['over_under']}")
+    # 📊 Edge Meter
+    st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}% ({conf_color})")
+
+    st.markdown(f"**Edge:** {row['edge_pp']:+.2f} pp | **EV:** {ev:+.2f}% | **Spread:** {row['spread']} | **O/U:** {row['over_under']}")
+
+    # Recommendation
+    if row["edge_pp"] > edge_thresh:
+        rec = "🏠 Bet Home"
+    elif row["edge_pp"] < -edge_thresh:
+        rec = "🛫 Bet Away"
+    else:
+        rec = "🚫 No Bet"
     st.markdown(f"**Recommendation:** {rec}")
 
-    # 🔍 Expandable Game Details
-    with st.expander("📊 View Game Details"):
-        st.markdown(f"**Model Win Probability:** {row['home_win_prob_model']*100:.1f}%")
-        st.markdown(f"**Market Win Probability:** {row['market_prob_home']*100:.1f}%")
-        st.markdown(f"**Blended Probability:** {row['blended_prob_home']*100:.1f}%")
-        st.markdown(f"**ELO (Home-Away):** {row['elo_home']:.0f} - {row['elo_away']:.0f}")
-        st.markdown(f"**Injury Diff:** {row['inj_diff']:+.1f}")
-        st.markdown(f"**Weather:** {row['temp_c']:.1f}°C, {row['wind_kph']:.1f} kph wind, {row['precip_prob']*100:.1f}% precip chance")
-        st.markdown(f"**Confidence:** {abs(row['edge_pp']):.1f} pp edge | {'🟢 High' if abs(row['edge_pp']) >= 3 else '🔴 Low'}")
+    # 📈 Expandable Breakdown
+    with st.expander("📊 Detailed Betting Breakdown"):
+        fig, ax = plt.subplots(figsize=(4, 1.5))
+        ax.bar(["Model", "Market"], [row["home_win_prob_model"]*100, row["market_prob_home"]*100])
+        ax.set_ylim(0, 100)
+        ax.set_ylabel("% Home Win Prob")
+        ax.set_title("Model vs Market")
+        st.pyplot(fig)
 
-st.caption("v9.9 — ESPN-integrated schedule, fixed spreads, and correctness tracking.")
+        st.markdown(f"**Model Win Prob:** {row['home_win_prob_model']*100:.1f}%")
+        st.markdown(f"**Market Win Prob:** {row['market_prob_home']*100:.1f}%")
+        st.markdown(f"**Expected Value (EV):** {ev:+.2f}% ({conf_color})")
+        st.markdown(f"**Blended Probability:** {row['blended_prob_home']*100:.1f}%")
+        st.markdown(f"**ELO (H-A):** {row['elo_home']:.0f} - {row['elo_away']:.0f}")
+        st.markdown(f"**Weather:** {row['temp_c']:.1f}°C, {row['wind_kph']:.1f} kph, {row['precip_prob']*100:.1f}% rain chance")
+
+st.caption("v10.2 — Expected Value + Confidence Levels + Visual Edge Meter")
