@@ -1,5 +1,5 @@
-﻿# streamlit_app.py — DJBets NFL Predictor v10.8b
-# Fix: over_under fillna TypeError + stable logo mapping + clean predictions
+﻿# streamlit_app.py — DJBets NFL Predictor v11.0
+# Fix: correct spread logic + restore sidebar ROI/record + keep expanders/tracker
 
 import os
 import numpy as np
@@ -105,9 +105,8 @@ def simulate_features(df, week):
     return df
 
 # --------------------------------------------------------------
-# 🧾 Logo Finder (matches abbreviation or team nickname)
+# 🧾 Logo Finder
 def get_logo_path(team_name, team_abbr):
-    """Try to match logo files by either abbreviation (BUF.png) or nickname (bills.png)."""
     candidates = [
         LOGO_DIR / f"{team_abbr.lower()}.png",
         LOGO_DIR / f"{team_name.split()[-1].lower()}.png",
@@ -118,7 +117,7 @@ def get_logo_path(team_name, team_abbr):
     return None
 
 # --------------------------------------------------------------
-# 🎛️ Sidebar
+# 🎛️ Sidebar Controls
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 tab = st.sidebar.radio("View Mode", ["Predictor", "Model Tracker"])
 season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
@@ -136,7 +135,6 @@ if sched.empty:
     st.warning("No games found for this week.")
     st.stop()
 
-# Fill missing spreads and O/U correctly
 sched["spread"] = sched["spread"].fillna(sched["elo_diff"] / 25)
 if "over_under" not in sched.columns:
     sched["over_under"] = np.nan
@@ -157,19 +155,39 @@ if tab == "Predictor":
     st.title(f"🏈 DJBets NFL Predictor — {season} Week {week}")
 
     history_records = []
+    total_correct = total_bets = total_pnl = 0
+
     for _, row in sched.iterrows():
         kickoff = row["kickoff_et"].strftime("%a %b %d %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
         prob = row["blended_prob_home"]
+        spread = row.get("spread", np.nan)
 
         if "final" in row["state"]:
             home_win = row["home_score"] > row["away_score"]
-            model_home = row["blended_prob_home"] > 0.5
-            result_tag = "✅ Correct" if home_win == model_home else "❌ Wrong"
+            model_home = prob > 0.5
             correct = int(home_win == model_home)
             pnl = 1 if correct else -1
+            result_tag = "✅ Correct" if correct else "❌ Wrong"
         else:
-            result_tag, correct, pnl = "⏳ Pending", np.nan, 0
+            home_win, correct, pnl, result_tag = None, np.nan, 0, "⏳ Pending"
 
+        # Spread-based recommendation
+        if np.isnan(spread):
+            rec = "🚫 No Spread Data"
+        else:
+            if prob > 0.5 and row["edge_pp"] > edge_thresh:
+                rec = f"🏠 Bet Home ({spread:+.1f})"
+            elif prob < 0.5 and row["edge_pp"] < -edge_thresh:
+                rec = f"🛫 Bet Away ({spread:+.1f})"
+            else:
+                rec = "🚫 No Bet"
+
+        if "final" in row["state"] and rec != "🚫 No Bet":
+            total_bets += 1
+            total_correct += correct
+            total_pnl += pnl
+
+        # --- Display Card
         cols = st.columns([1, 3, 1])
         away_logo = get_logo_path(row["away_team"], row["away_abbr"])
         home_logo = get_logo_path(row["home_team"], row["home_abbr"])
@@ -192,19 +210,15 @@ if tab == "Predictor":
         conf = "🟢 High" if abs(row["edge_pp"]) > 5 else "🟡 Medium" if abs(row["edge_pp"]) > 2 else "🔴 Low"
         st.progress(min(max(prob, 0), 1), text=f"Home Win Probability: {prob*100:.1f}% ({conf})")
 
-        spread = row.get("spread", np.nan)
-        spread_text = f"{spread:+.1f}" if not np.isnan(spread) else "N/A"
+        st.markdown(f"**Spread:** {spread:+.1f} | **O/U:** {row['over_under']:.1f} | **Edge:** {row['edge_pp']:+.2f} pp | **Recommendation:** {rec}")
 
-        if np.isnan(spread):
-            rec = "🚫 No Spread Data"
-        elif row["edge_pp"] > edge_thresh:
-            rec = f"🏠 Bet Home ({spread_text})"
-        elif row["edge_pp"] < -edge_thresh:
-            rec = f"🛫 Bet Away ({spread_text})"
-        else:
-            rec = "🚫 No Bet"
-
-        st.markdown(f"**Spread:** {spread_text} | **O/U:** {row['over_under']:.1f} | **Edge:** {row['edge_pp']:+.2f} pp | **Recommendation:** {rec}")
+        # Expandable game details
+        with st.expander("📊 Game Details"):
+            st.write(f"**ELO Home:** {row['elo_home']:.1f} | **ELO Away:** {row['elo_away']:.1f}")
+            st.write(f"**ELO Diff:** {row['elo_diff']:.1f}")
+            st.write(f"**Injury Diff:** {row['inj_diff']:.1f}")
+            st.write(f"**Weather:** {row['temp_c']:.1f}°C, Wind {row['wind_kph']:.1f} km/h, Precip {row['precip_prob']*100:.1f}%")
+            st.write(f"**Model Prob:** {row['home_win_prob_model']*100:.1f}% | **Market Prob:** {row['market_prob_home']*100:.1f}% | **Blended:** {prob*100:.1f}%")
 
         history_records.append({
             "season": season,
@@ -217,14 +231,25 @@ if tab == "Predictor":
             "pnl": pnl,
         })
 
-    # Save for tracker
+    # --- Sidebar summary
+    if total_bets > 0:
+        acc = total_correct / total_bets * 100
+        roi = total_pnl / total_bets * 100
+        st.sidebar.markdown("### 📊 Model Record")
+        st.sidebar.metric("Bets Made", total_bets)
+        st.sidebar.metric("Accuracy", f"{acc:.1f}%")
+        st.sidebar.metric("ROI", f"{roi:+.2f}%")
+    else:
+        st.sidebar.info("📈 No completed games yet.")
+
+    # --- Save Tracker
     hist_path = DATA_DIR / "predictions_history.csv"
     hist_df = pd.DataFrame(history_records)
     if hist_path.exists():
         old = pd.read_csv(hist_path)
         hist_df = pd.concat([old, hist_df]).drop_duplicates(subset=["season", "week", "home", "away"], keep="last")
     hist_df.to_csv(hist_path, index=False)
-    st.caption("v10.8b — Fixed fillna error + logo mapping")
+    st.caption("v11.0 — fixed spread logic + restored sidebar metrics")
 
 # --------------------------------------------------------------
 # 📈 Model Tracker Tab
@@ -236,6 +261,8 @@ else:
         st.stop()
 
     hist = pd.read_csv(hist_path)
+    hist["week"] = hist["week"].astype(int)
+
     st.dataframe(hist, use_container_width=True)
     st.download_button("⬇️ Export CSV", hist.to_csv(index=False).encode(), "model_tracker.csv", "text/csv")
 
