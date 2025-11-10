@@ -113,14 +113,18 @@ def load_or_train_model(hist):
             st.warning(f"⚠️ Added missing feature column: {f}")
             hist[f] = np.random.uniform(-1, 1, len(hist))
 
-    # Fill NaNs and coerce all features to float
+    # Clean data
     for f in features:
         hist[f] = pd.to_numeric(hist[f], errors="coerce").fillna(np.random.uniform(-1, 1))
-
-    # Simulate environment and random features if missing
     hist["home_win"] = (hist["home_score"] > hist["away_score"]).astype(int)
+
     X = hist[features].astype(float)
     y = hist["home_win"].astype(int)
+
+    # Check label diversity
+    if y.nunique() < 2:
+        st.warning("⚠️ Not enough label variety — generating balanced simulated outcomes.")
+        y = np.random.choice([0, 1], len(y))
 
     if len(X) < 10:
         st.warning("⚠️ Not enough valid data — using simulated training set.")
@@ -133,7 +137,6 @@ def load_or_train_model(hist):
         })
         y = np.random.choice([0, 1], 100)
 
-    # Final safety check: no NaNs
     X = X.replace([np.inf, -np.inf], 0).fillna(0)
 
     model.fit(X, y)
