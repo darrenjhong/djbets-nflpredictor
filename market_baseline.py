@@ -1,48 +1,48 @@
-# market_baseline.py
-# Utilities for converting betting lines to probabilities and blending with model output
+# market_baseline.py — robust Vegas spread conversion and blending logic
 
 import numpy as np
-import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
-
-# --- odds conversions ---
-def american_to_prob(ml):
-    """Convert American moneyline to implied probability."""
-    try:
-        ml = float(str(ml).replace("−", "-"))
-        if ml > 0:
-            return 100.0 / (ml + 100.0)
-        else:
-            return (-ml) / ((-ml) + 100.0)
-    except Exception:
-        return np.nan
-
-
-def remove_vig(p_home, p_away):
-    """Normalize implied probabilities to sum to 1."""
-    s = p_home + p_away
-    if s <= 0:
-        return np.nan, np.nan
-    return p_home / s, p_away / s
-
+import re
 
 def spread_to_home_prob(spread):
-    """Approximate home win probability from point spread."""
+    """
+    Convert a point spread (e.g. 'KC -3.5', 'BUF +2.5', 'Even', 'Pick') into
+    the market-implied home win probability.
+    Positive spread = home underdog, negative spread = home favorite.
+    Returns np.nan if parsing fails.
+    """
+    if spread is None or (isinstance(spread, float) and np.isnan(spread)):
+        return np.nan
+    if not isinstance(spread, str):
+        spread = str(spread)
+
+    s = spread.strip().lower()
+
+    # Handle cases like "Even", "Pick", "Pick'em"
+    if "even" in s or "pick" in s:
+        return 0.5
+
+    # Extract numeric spread (may appear after a team name)
+    m = re.search(r"([-+−]?\d+\.?\d*)", s)
+    if not m:
+        return np.nan
+
     try:
-        s = float(str(spread).replace("−", "-"))
+        num = m.group(1).replace("−", "-")  # normalize minus sign
+        spread_val = float(num)
     except Exception:
         return np.nan
-    k = 6.8  # logistic slope for NFL
-    return 1.0 / (1.0 + np.exp(-(s) / k))
+
+    # Convert spread to win probability using logistic model approximation
+    # Empirical relationship: spread of -3 ≈ 0.60 home win prob
+    prob = 1 / (1 + np.exp(-spread_val / 7.5))
+    return float(np.clip(prob, 0.05, 0.95))
 
 
-def blend_probs(model_p, market_p, alpha=0.6):
-    """Blend model and market probabilities."""
-    if np.isnan(model_p) and np.isnan(market_p):
+def blend_probs(model_prob, market_prob, alpha=0.6):
+    """
+    Blend model and market probabilities with a linear weight.
+    alpha = 1.0 → fully market, alpha = 0.0 → fully model
+    """
+    if np.isnan(model_prob) or np.isnan(market_prob):
         return np.nan
-    if np.isnan(market_p):
-        return model_p
-    if np.isnan(model_p):
-        return market_p
-    return alpha * market_p + (1 - alpha) * model_p
+    return float(alpha * market_prob + (1 - alpha) * model_prob)
