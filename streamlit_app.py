@@ -1,5 +1,5 @@
-﻿# DJBets NFL Predictor v11.0
-# Adds: market baseline, probability blending, ROI tracking, model vs market edges
+﻿# DJBets NFL Predictor v11.1
+# Adds: explanations for sliders, ROI fix, model performance summary
 
 import os
 import numpy as np
@@ -7,12 +7,8 @@ import pandas as pd
 import requests
 import xgboost as xgb
 import streamlit as st
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-import hashlib
-
+from datetime import datetime
 from market_baseline import spread_to_home_prob, blend_probs
-from trainer import train_walkforward
 
 # --------------------------------------------------------------
 # ⚙️ Configuration
@@ -26,19 +22,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "temp_c", "wind_kph", "precip_prob"]
 
-TEAMS = [
-    "BUF", "MIA", "NE", "NYJ", "BAL", "CIN", "CLE", "PIT",
-    "HOU", "IND", "JAX", "TEN", "DEN", "KC", "LV", "LAC",
-    "DAL", "NYG", "PHI", "WAS", "CHI", "DET", "GB", "MIN",
-    "ATL", "CAR", "NO", "TB", "ARI", "LAR", "SF", "SEA"
-]
-
 # --------------------------------------------------------------
-# 🧠 Model
+# 🧠 Model Loader
 # --------------------------------------------------------------
 @st.cache_resource
 def load_or_train_model():
-    """Load or train a simple baseline XGBoost model."""
     if os.path.exists(MODEL_FILE):
         model = xgb.XGBClassifier()
         model.load_model(MODEL_FILE)
@@ -61,11 +49,10 @@ def load_or_train_model():
     return model
 
 # --------------------------------------------------------------
-# 🏈 ESPN Data Scraper
+# 🏈 ESPN Schedule Scraper
 # --------------------------------------------------------------
 @st.cache_data(ttl=604800)
 def fetch_schedule(season: int):
-    """Scrape schedule and scores directly from ESPN."""
     games = []
     for week in range(1, MAX_WEEKS + 1):
         url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}&seasontype=2&week={week}"
@@ -124,17 +111,6 @@ def fetch_schedule(season: int):
 # --------------------------------------------------------------
 # 🔧 Helper Functions
 # --------------------------------------------------------------
-def parse_spread(value):
-    if not isinstance(value, str) or value in ["N/A", "", None]:
-        return np.nan
-    try:
-        num = ''.join(ch for ch in value if ch in "+-.0123456789")
-        if num == "" or num == ".":
-            return np.nan
-        return float(num)
-    except Exception:
-        return np.nan
-
 def simulate_features(df, week=1):
     np.random.seed(week * 123)
     df["elo_diff"] = np.random.normal(0, 100, len(df))
@@ -147,29 +123,53 @@ def simulate_features(df, week=1):
     return df
 
 def compute_roi(df):
+    """Compute simulated ROI for all completed games with edge predictions."""
+    if "edge_pp" not in df.columns:
+        return 0.0, 0, 0.0
+
+    df = df.copy()
+    df["edge_pp"] = pd.to_numeric(df["edge_pp"], errors="coerce")
+
     stake = 1.0
     pnl, bets = 0.0, 0
+
     for _, r in df.iterrows():
-        if np.isnan(r.get("edge_pp")) or abs(r["edge_pp"]) < 3:
+        edge_val = r.get("edge_pp", np.nan)
+        if pd.isna(edge_val) or abs(edge_val) < 3:
             continue
-        pick_home = r["edge_pp"] > 0
-        if np.isnan(r["home_score"]) or np.isnan(r["away_score"]):
+
+        pick_home = edge_val > 0
+        home_score = r.get("home_score", np.nan)
+        away_score = r.get("away_score", np.nan)
+
+        if pd.isna(home_score) or pd.isna(away_score):
             continue
-        home_win = r["home_score"] > r["away_score"]
+
+        home_win = home_score > away_score
         win = (pick_home == home_win)
-        pnl += (0.91 if win else -1.0)  # -110 line
+        pnl += (0.91 if win else -1.0)
         bets += 1
-    return pnl, bets, (pnl / max(bets, 1))
+
+    roi = pnl / max(bets, 1)
+    return pnl, bets, roi
 
 # --------------------------------------------------------------
 # 🎛️ Sidebar Controls
 # --------------------------------------------------------------
 st.sidebar.header("🏈 DJBets NFL Predictor")
-season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
-week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS+1)), index=0)
 
-ALPHA = st.sidebar.slider("Market weight (α)", 0.0, 1.0, 0.6, 0.05)
-edge_thresh = st.sidebar.slider("Bet threshold (pp)", 0.0, 10.0, 3.0, 0.5)
+season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
+week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS + 1)), index=0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Model Settings")
+
+ALPHA = st.sidebar.slider("Market Weight (α)", 0.0, 1.0, 0.6, 0.05,
+                          help="Controls how much weight to give to **market (Vegas)** probabilities vs the model. "
+                               "α = 1 means fully trust the market; α = 0 means trust only the model.")
+edge_thresh = st.sidebar.slider("Bet Threshold (pp)", 0.0, 10.0, 3.0, 0.5,
+                                help="Minimum edge (percentage points) vs market required to trigger a recommended bet. "
+                                     "Higher = fewer but stronger bets; lower = more frequent but riskier bets.")
 
 if st.sidebar.button("♻️ Refresh Data"):
     fetch_schedule.clear()
@@ -187,7 +187,6 @@ if week_df.empty:
     st.warning("No games found for this week.")
     st.stop()
 
-# Generate features
 week_df = simulate_features(week_df, week)
 X = week_df[MODEL_FEATURES].astype(float)
 week_df["home_win_prob_model"] = model.predict_proba(X)[:, 1]
@@ -197,22 +196,27 @@ week_df["blended_prob_home"] = [
 ]
 week_df["edge_pp"] = (week_df["blended_prob_home"] - week_df["market_prob_home"]) * 100
 
-# ROI tracking
+# Safely merge into full schedule for ROI computation
+if "edge_pp" not in sched.columns and "edge_pp" in week_df.columns:
+    sched = sched.merge(week_df[["season", "week", "home_team", "away_team", "edge_pp"]],
+                        on=["season", "week", "home_team", "away_team"], how="left")
+
 pnl, bets, roi = compute_roi(sched)
 
 # --------------------------------------------------------------
 # 🧾 Sidebar Metrics
 # --------------------------------------------------------------
 st.sidebar.markdown("### 📈 Performance")
-st.sidebar.markdown(f"💵 ROI: **{roi*100:.1f}%** ({bets} bets)")
-st.sidebar.caption("Based on closed games and simulated -110 lines")
+st.sidebar.metric("💵 ROI", f"{roi*100:.1f}%", f"{pnl:+.2f} units")
+st.sidebar.metric("🎯 Bets Made", f"{bets}")
+st.sidebar.caption("ROI simulated using -110 odds (win pays +0.91 units)")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("🟩 = Home favored\n🟥 = Away favored\n🟨 = Neutral")
-st.sidebar.caption("Bar = predicted home win probability (blended)")
+st.sidebar.markdown("🟩 = Home favored 🟥 = Away favored 🟨 = Even match")
+st.sidebar.caption("Bars represent **blended home win probability**")
 
 # --------------------------------------------------------------
-# 🎯 Display Games
+# 🎯 Main Display
 # --------------------------------------------------------------
 st.title(f"🏈 DJBets NFL Predictor — Week {week} ({season})")
 
@@ -227,6 +231,7 @@ for _, row in week_df.iterrows():
 
     st.markdown(f"### {row['away_team']} @ {row['home_team']} ({status})")
     st.markdown(f"**{color}** | {edge_txt}")
+
     kickoff = row["kickoff_et"].strftime("%a %b %d, %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
     st.caption(f"Kickoff: {kickoff}")
 
@@ -242,6 +247,7 @@ for _, row in week_df.iterrows():
     with col2:
         st.progress(prob, text=f"Home Win Probability: {prob*100:.1f}%")
         st.markdown(f"Spread: {row['spread']} | O/U: {row['over_under']}")
+
         if state == "post" and not np.isnan(row["home_score"]) and not np.isnan(row["away_score"]):
             home_win = row["home_score"] > row["away_score"]
             pred_win = prob >= 0.5
@@ -257,8 +263,10 @@ for _, row in week_df.iterrows():
             st.markdown(f"**Market Probability:** {row['market_prob_home']*100:.1f}%")
             st.markdown(f"**Blended Probability:** {row['blended_prob_home']*100:.1f}%")
             st.markdown(f"**Edge:** {edge:+.2f} pp")
-            st.markdown(f"**Recommendation:** " +
-                        ("🏠 Bet Home" if edge > edge_thresh else "🛫 Bet Away" if edge < -edge_thresh else "🚫 No Bet"))
+            st.markdown(
+                "**Recommendation:** " +
+                ("🏠 Bet Home" if edge > edge_thresh else "🛫 Bet Away" if edge < -edge_thresh else "🚫 No Bet")
+            )
 
 st.markdown("---")
-st.caption("🏈 DJBets NFL Predictor v11.0 — blended model + market edge tracking")
+st.caption("🏈 DJBets NFL Predictor v11.1 — Market blending, ROI tracking, and smart bet thresholding.")
