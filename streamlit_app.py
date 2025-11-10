@@ -1,5 +1,6 @@
-﻿# DJBets NFL Predictor v10.8
-# Adds: sidebar performance record + clarified green/red meaning
+﻿# DJBets NFL Predictor v10.9
+# Fixes UnhashableParamError by avoiding caching on unhashable model objects.
+# Adds minor record calculation improvements and stable sidebar.
 
 import os
 import numpy as np
@@ -9,6 +10,7 @@ import xgboost as xgb
 import matplotlib.pyplot as plt
 import streamlit as st
 from datetime import datetime, timedelta
+import hashlib
 
 # --------------------------------------------------------------
 # ⚙️ Config
@@ -154,47 +156,8 @@ def parse_spread(value):
     except Exception:
         return np.nan
 
-@st.cache_data(ttl=1800)
-def compute_model_record(sched_df, model):
-    df = sched_df.query("state == 'post' and home_score.notna() and away_score.notna()").copy()
-    if df.empty:
-        return (0, 0, 0.0)
-    df = simulate_features(df)
-    X = df[MODEL_FEATURES].astype(float)
-    df["home_win_prob"] = model.predict_proba(X)[:,1]
-    df["predicted_home_win"] = (df["home_win_prob"] >= 0.5)
-    df["actual_home_win"] = df["home_score"] > df["away_score"]
-    correct = (df["predicted_home_win"] == df["actual_home_win"]).sum()
-    total = len(df)
-    pct = (correct / total) * 100 if total > 0 else 0
-    return (correct, total - correct, pct)
 
-# --------------------------------------------------------------
-# 🔢 Sidebar Controls
-# --------------------------------------------------------------
-st.sidebar.header("🏈 DJBets NFL Predictor")
-season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
-week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS+1)), index=0)
-if st.sidebar.button("♻️ Refresh Schedule"):
-    fetch_schedule.clear()
-    st.rerun()
-
-# --------------------------------------------------------------
-# 📊 Load + process
-# --------------------------------------------------------------
-model = load_or_train_model()
-sched = fetch_schedule(season)
-sched["kickoff_et"] = pd.to_datetime(sched["kickoff_et"], errors="coerce")
-
-week_df = sched.query("week == @week").copy()
-if week_df.empty:
-    st.warning("No games found for this week.")
-    st.stop()
-
-# --------------------------------------------------------------
-# 🧮 Simulate features and predict
-# --------------------------------------------------------------
-def simulate_features(df):
+def simulate_features(df, week=1):
     np.random.seed(week * 123)
     df["elo_diff"] = np.random.normal(0, 100, len(df))
     df["temp_c"] = np.random.uniform(-5, 25, len(df))
@@ -205,26 +168,70 @@ def simulate_features(df):
     ).round(1)
     return df
 
-week_df = simulate_features(week_df)
+# --------------------------------------------------------------
+# 🧾 Compute model record (safe caching)
+# --------------------------------------------------------------
+@st.cache_data(ttl=1800)
+def compute_model_record(schedule_hash: str, sched_df: pd.DataFrame):
+    df = sched_df.query("state == 'post' and home_score.notna() and away_score.notna()").copy()
+    if df.empty:
+        return (0, 0, 0.0)
+    df = simulate_features(df)
+    X = df[MODEL_FEATURES].astype(float)
+    model = load_or_train_model()
+    df["home_win_prob"] = model.predict_proba(X)[:,1]
+    df["predicted_home_win"] = (df["home_win_prob"] >= 0.5)
+    df["actual_home_win"] = df["home_score"] > df["away_score"]
+    correct = (df["predicted_home_win"] == df["actual_home_win"]).sum()
+    total = len(df)
+    pct = (correct / total) * 100 if total > 0 else 0
+    return (correct, total - correct, pct)
+
+# --------------------------------------------------------------
+# 🔢 Sidebar
+# --------------------------------------------------------------
+st.sidebar.header("🏈 DJBets NFL Predictor")
+season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
+week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS+1)), index=0)
+if st.sidebar.button("♻️ Refresh Schedule"):
+    fetch_schedule.clear()
+    st.rerun()
+
+# --------------------------------------------------------------
+# 📊 Load data
+# --------------------------------------------------------------
+model = load_or_train_model()
+sched = fetch_schedule(season)
+sched["kickoff_et"] = pd.to_datetime(sched["kickoff_et"], errors="coerce")
+
+week_df = sched.query("week == @week").copy()
+if week_df.empty:
+    st.warning("No games found for this week.")
+    st.stop()
+
+# Generate a short hash of schedule for caching
+sched_hash = hashlib.sha1(pd.util.hash_pandas_object(sched, index=False).values).hexdigest()
+
+# Compute model record safely
+correct, incorrect, pct = compute_model_record(sched_hash, sched)
+st.sidebar.markdown("### 📈 Model Record")
+st.sidebar.markdown(f"**Record:** {correct}-{incorrect} ({pct:.1f}%)")
+st.sidebar.caption("Updated from completed ESPN games")
+st.sidebar.markdown("---")
+st.sidebar.markdown("🟩 = Home favored\n🟥 = Away favored")
+st.sidebar.caption("Bar represents predicted home win probability")
+
+# --------------------------------------------------------------
+# 🎯 Predict
+# --------------------------------------------------------------
+week_df = simulate_features(week_df, week)
 X = week_df[MODEL_FEATURES].astype(float)
 week_df["home_win_prob"] = model.predict_proba(X)[:,1]
 week_df["predicted_spread"] = np.round(-7 * (week_df["home_win_prob"] - 0.5), 1)
 week_df["predicted_total"] = np.round(week_df["over_under"] + np.random.normal(0, 2, len(week_df)), 1)
 
 # --------------------------------------------------------------
-# 🧾 Sidebar record display
-# --------------------------------------------------------------
-correct, incorrect, pct = compute_model_record(sched, model)
-st.sidebar.markdown("### 📈 Model Record")
-st.sidebar.markdown(f"**Record:** {correct}-{incorrect} ({pct:.1f}%)")
-st.sidebar.caption("Updated from completed ESPN games")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("🟩 = Home favored\n🟥 = Away favored")
-st.sidebar.caption("Bar represents predicted home win probability")
-
-# --------------------------------------------------------------
-# 🎯 Main Display
+# 🎨 Display
 # --------------------------------------------------------------
 st.title(f"🏈 DJBets NFL Predictor — Week {week} ({season})")
 
@@ -232,7 +239,6 @@ for _, row in week_df.iterrows():
     vegas_spread = parse_spread(row["spread"])
     state = row.get("state", "pre")
     color = {"pre": "🟡 Upcoming", "in": "🟢 Live", "post": "🔵 Final"}.get(state, "⚪ Unknown")
-
     bg = "rgba(0,255,0,0.08)" if row["home_win_prob"] > 0.55 else "rgba(255,0,0,0.08)"
 
     st.markdown(f'<div style="background-color:{bg}; padding: 1rem; border-radius: 1rem;">', unsafe_allow_html=True)
@@ -288,4 +294,4 @@ for _, row in week_df.iterrows():
     st.markdown("</div><br>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("🏈 DJBets NFL Predictor v10.8 — includes model record, spread/O-U, and visual clarity.")
+st.caption("🏈 DJBets NFL Predictor v10.9 — fixed caching, sidebar record, clear color meaning.")
