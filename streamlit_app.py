@@ -23,6 +23,29 @@ else:
     st.info(f"✅ Loaded historical data with {len(hist)} games.")
 
 # --------------------------------------------------------------
+# 🏈 Fix team codes (replace numeric or short names)
+# --------------------------------------------------------------
+TEAM_MAP = {
+    "1": "ARI", "2": "ATL", "3": "BAL", "4": "BUF", "5": "CAR", "6": "CHI", "7": "CIN", "8": "CLE",
+    "9": "DAL", "10": "DEN", "11": "DET", "12": "GB", "13": "HOU", "14": "IND", "15": "JAX", "16": "KC",
+    "17": "LV", "18": "LAC", "19": "LAR", "20": "MIA", "21": "MIN", "22": "NE", "23": "NO", "24": "NYG",
+    "25": "NYJ", "26": "PHI", "27": "PIT", "28": "SEA", "29": "SF", "30": "TB", "31": "TEN", "32": "WAS",
+}
+
+def normalize_team(value):
+    if pd.isna(value):
+        return None
+    s = str(value).strip().upper()
+    if s in TEAM_MAP.values():
+        return s
+    if s in TEAM_MAP:
+        return TEAM_MAP[s]
+    return s
+
+for col in ["home_team", "away_team"]:
+    hist[col] = hist[col].apply(normalize_team)
+
+# --------------------------------------------------------------
 # 🧹 Clean + Standardize Data
 # --------------------------------------------------------------
 required_cols = [
@@ -35,97 +58,73 @@ for col in required_cols:
     if col not in hist.columns:
         hist[col] = np.nan
 
-# Convert to numeric safely
 for col in ["spread", "over_under", "elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]:
     hist[col] = pd.to_numeric(hist[col], errors="coerce").fillna(0)
 
-# Generate week numbers if missing
-if "week" not in hist.columns or hist["week"].isna().all():
-    hist["week"] = ((hist.groupby("season").cumcount()) // 16 + 1).clip(1, 18)
-
 # --------------------------------------------------------------
-# 🧠 Robust Model Loader/Trainer
+# 🧠 Safe XGBoost Model
 # --------------------------------------------------------------
 @st.cache_resource
 def load_or_train_model(df):
-    """Train XGBoost safely, with fallbacks for missing or invalid data."""
     features = ["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]
     df = df.copy()
 
-    # Compute binary target only for completed games
     df["home_win"] = np.where(df["home_score"] > df["away_score"], 1, 0)
     df = df.dropna(subset=["home_win"])
 
-    # Keep only complete numeric rows
     X = df[features].apply(pd.to_numeric, errors="coerce").fillna(0)
     y = df["home_win"].astype(int)
 
-    # Validate
     if len(X) < 10 or y.nunique() < 2:
-        st.warning("⚠️ Not enough valid training data — loading default model.")
+        st.warning("⚠️ Not enough valid data — using fallback model.")
+        dummy_X = np.random.rand(20, len(features))
+        dummy_y = np.random.randint(0, 2, 20)
         model = xgb.XGBClassifier(eval_metric="logloss", n_estimators=10)
-        dummy_X = np.random.rand(10, len(features))
-        dummy_y = np.random.randint(0, 2, 10)
         model.fit(dummy_X, dummy_y)
         return model
 
-    # Remove invalid rows
-    mask = (~X.isna().any(axis=1)) & (~y.isna())
-    X, y = X[mask], y[mask]
-
-    # Train XGBoost safely
-    try:
-        model = xgb.XGBClassifier(
-            eval_metric="logloss",
-            n_estimators=200,
-            learning_rate=0.05,
-            max_depth=4,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            use_label_encoder=False,
-        )
-        model.fit(X, y)
-    except Exception as e:
-        st.error(f"⚠️ Model training failed: {e}")
-        model = xgb.XGBClassifier(eval_metric="logloss", n_estimators=10)
-        dummy_X = np.random.rand(10, len(features))
-        dummy_y = np.random.randint(0, 2, 10)
-        model.fit(dummy_X, dummy_y)
-
+    model = xgb.XGBClassifier(
+        eval_metric="logloss",
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+    )
+    model.fit(X, y)
     return model
 
-
 model = load_or_train_model(hist)
-st.success("✅ Model trained successfully and validated.")
+st.success("✅ Model trained successfully.")
 
 # --------------------------------------------------------------
-# 🎛️ Sidebar Controls
+# 🎛️ Sidebar
 # --------------------------------------------------------------
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 
 season = st.sidebar.selectbox("Season", sorted(hist["season"].unique(), reverse=True))
-weeks_available = sorted([int(w) for w in hist.loc[hist["season"] == season, "week"].unique() if pd.notna(w)])
-if not weeks_available:
-    weeks_available = list(range(1, 19))
-week = st.sidebar.selectbox("Week", weeks_available, index=0)
 
-# Tooltips
+weeks_available = sorted(hist.loc[hist["season"] == season, "week"].dropna().unique())
+if len(weeks_available) < 18:
+    weeks_available = list(range(1, 19))
+
+week = st.sidebar.selectbox("Week", weeks_available, index=weeks_available.index(max(weeks_available)))
+
 st.sidebar.markdown(
-    "### ⚖️ Market Weight\n"
-    "<small>How much Vegas market data affects blended probabilities.</small>",
+    "### ⚖️ Market Weight\n<small>How much Vegas market data influences the blended probabilities.</small>",
     unsafe_allow_html=True,
 )
 market_weight = st.sidebar.slider("Market Weight", 0.0, 1.0, 0.5, 0.05)
 
 st.sidebar.markdown(
-    "### 💰 Bet Threshold\n"
-    "<small>Minimum 'edge' (in %) before the model recommends a bet.</small>",
+    "### 💰 Bet Threshold\n<small>Minimum edge (%) before recommending a bet.</small>",
     unsafe_allow_html=True,
 )
 bet_threshold = st.sidebar.slider("Bet Threshold (%)", 1, 10, 3, 1)
 
 # --------------------------------------------------------------
-# 🧮 Generate Predictions
+# 🧮 Predictions
 # --------------------------------------------------------------
 week_df = hist[(hist["season"] == season) & (hist["week"] == week)].copy()
 
@@ -135,10 +134,6 @@ else:
     st.markdown(f"### 📅 Week {week} Predictions")
 
     features = ["elo_diff", "inj_diff", "temp_c", "wind_kph", "precip_prob"]
-    for f in features:
-        if f not in week_df.columns:
-            week_df[f] = 0.0
-
     X = week_df[features].apply(pd.to_numeric, errors="coerce").fillna(0)
 
     try:
@@ -148,9 +143,7 @@ else:
         week_df["home_win_prob_model"] = 0.5
 
     week_df["market_prob"] = 1 / (1 + np.exp(-week_df["spread"].fillna(0)))
-    week_df["blended_prob"] = (
-        market_weight * week_df["market_prob"] + (1 - market_weight) * week_df["home_win_prob_model"]
-    )
+    week_df["blended_prob"] = market_weight * week_df["market_prob"] + (1 - market_weight) * week_df["home_win_prob_model"]
     week_df["edge"] = (week_df["home_win_prob_model"] - week_df["market_prob"]) * 100
     week_df["recommendation"] = np.where(
         abs(week_df["edge"]) >= bet_threshold,
@@ -159,23 +152,29 @@ else:
     )
 
     # --------------------------------------------------------------
-    # 🏈 Display Predictions
+    # 🏈 Display with Logos
     # --------------------------------------------------------------
     for _, row in week_df.iterrows():
-        home, away = row.get("home_team", "HOME"), row.get("away_team", "AWAY")
-        spread = row.get("spread", "N/A")
-        ou = row.get("over_under", "N/A")
+        home, away = row.get("home_team", ""), row.get("away_team", "")
+        spread, ou = row.get("spread", "N/A"), row.get("over_under", "N/A")
         model_prob = row["home_win_prob_model"] * 100
         rec = row["recommendation"]
 
-        st.markdown(
-            f"""
-            ### {away} @ {home}
-            **Spread:** {spread} | **O/U:** {ou}  
-            **Model Win Prob (Home):** {model_prob:.1f}%  
-            **Recommendation:** {rec}
-            """
-        )
+        home_logo = f"logos/{home}.png"
+        away_logo = f"logos/{away}.png"
+
+        col1, col2, col3 = st.columns([2, 1, 2])
+        with col1:
+            st.image(away_logo, width=80)
+            st.markdown(f"**{away}**")
+        with col2:
+            st.markdown(
+                f"**Spread:** {spread}<br>**O/U:** {ou}<br>**Home Win Prob:** {model_prob:.1f}%<br>**{rec}**",
+                unsafe_allow_html=True,
+            )
+        with col3:
+            st.image(home_logo, width=80)
+            st.markdown(f"**{home}**")
 
 # --------------------------------------------------------------
 # 📊 Model Tracker
