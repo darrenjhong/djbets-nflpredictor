@@ -1,5 +1,5 @@
-﻿# DJBets NFL Predictor v10.6
-# Fixes: robust spread parsing, game state differentiation, final vs upcoming display
+﻿# DJBets NFL Predictor v10.8
+# Adds: algorithm record tracking, bar meaning labels, improved sidebar stats.
 
 import os
 import numpy as np
@@ -21,13 +21,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 MAX_WEEKS = 18
 MODEL_FEATURES = ["elo_diff", "temp_c", "wind_kph", "precip_prob"]
 
-TEAMS = [
-    "BUF", "MIA", "NE", "NYJ", "BAL", "CIN", "CLE", "PIT",
-    "HOU", "IND", "JAX", "TEN", "DEN", "KC", "LV", "LAC",
-    "DAL", "NYG", "PHI", "WAS", "CHI", "DET", "GB", "MIN",
-    "ATL", "CAR", "NO", "TB", "ARI", "LAR", "SF", "SEA"
-]
-
 # --------------------------------------------------------------
 # 🧠 Model (auto-train if missing)
 # --------------------------------------------------------------
@@ -40,22 +33,22 @@ def load_or_train_model():
 
     np.random.seed(42)
     df = pd.DataFrame({
-        "elo_diff": np.random.normal(0, 100, 500),
-        "temp_c": np.random.uniform(-5, 25, 500),
-        "wind_kph": np.random.uniform(0, 25, 500),
-        "precip_prob": np.random.uniform(0, 1, 500),
+        "elo_diff": np.random.normal(0, 100, 600),
+        "temp_c": np.random.uniform(-5, 25, 600),
+        "wind_kph": np.random.uniform(0, 25, 600),
+        "precip_prob": np.random.uniform(0, 1, 600),
     })
-    logits = 0.015*df["elo_diff"] - 0.05*(df["precip_prob"] - 0.4) - 0.02*(df["wind_kph"] - 10)
+    logits = 0.015*df["elo_diff"] - 0.04*(df["precip_prob"] - 0.4) - 0.02*(df["wind_kph"] - 10) + 0.01*(df["temp_c"] - 10)
     p = 1 / (1 + np.exp(-logits))
-    y = (np.random.uniform(0, 1, 500) < p).astype(int)
+    y = (np.random.uniform(0, 1, 600) < p).astype(int)
 
-    model = xgb.XGBClassifier(n_estimators=150, max_depth=3, learning_rate=0.1)
+    model = xgb.XGBClassifier(n_estimators=200, max_depth=3, learning_rate=0.08)
     model.fit(df[MODEL_FEATURES].values, y.values)
     model.save_model(MODEL_FILE)
     return model
 
 # --------------------------------------------------------------
-# 🏈 ESPN Scraper (robust with state detection)
+# 🏈 ESPN Data Loader (with state detection)
 # --------------------------------------------------------------
 @st.cache_data(ttl=604800)
 def fetch_schedule(season: int):
@@ -64,7 +57,6 @@ def fetch_schedule(season: int):
         url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}&seasontype=2&week={week}"
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            r.raise_for_status()
             data = r.json()
         except Exception:
             continue
@@ -110,86 +102,15 @@ def fetch_schedule(season: int):
                 "status_text": short_detail
             })
 
-    df = pd.DataFrame(games)
-    if df.empty:
-        st.warning("⚠️ ESPN returned no schedule, generating mock data.")
-        df = generate_mock_schedule(season)
-    df.to_csv(SCHEDULE_FILE, index=False)
-    return df
-
-def generate_mock_schedule(season: int):
-    np.random.seed(season)
-    rows = []
-    for week in range(1, MAX_WEEKS + 1):
-        np.random.shuffle(TEAMS)
-        for i in range(0, len(TEAMS), 2):
-            home, away = TEAMS[i], TEAMS[i+1]
-            rows.append({
-                "season": season,
-                "week": week,
-                "home_team": home,
-                "away_team": away,
-                "home_logo": f"https://a.espncdn.com/i/teamlogos/nfl/500/{home.lower()}.png",
-                "away_logo": f"https://a.espncdn.com/i/teamlogos/nfl/500/{away.lower()}.png",
-                "kickoff_et": (datetime.now() + timedelta(days=(week-1)*7)).isoformat(),
-                "spread": f"-{np.random.randint(1,8)}",
-                "over_under": np.random.randint(38, 55),
-                "home_score": np.nan,
-                "away_score": np.nan,
-                "state": "pre",
-                "status_text": "Scheduled"
-            })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(games)
 
 # --------------------------------------------------------------
-# 🔢 Sidebar Controls
-# --------------------------------------------------------------
-st.sidebar.header("🏈 DJBets NFL Predictor")
-season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
-week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS+1)), index=0)
-if st.sidebar.button("♻️ Refresh Schedule"):
-    fetch_schedule.clear()
-    st.rerun()
-
-# --------------------------------------------------------------
-# 📊 Load Data + Model
-# --------------------------------------------------------------
-model = load_or_train_model()
-sched = fetch_schedule(season)
-sched["kickoff_et"] = pd.to_datetime(sched["kickoff_et"], errors="coerce")
-
-week_df = sched.query("week == @week").copy()
-if week_df.empty:
-    st.warning("No games found for this week.")
-    st.stop()
-
-st.title(f"🏈 DJBets NFL Predictor — Week {week} ({season})")
-
-# --------------------------------------------------------------
-# 🧮 Predictive Features
-# --------------------------------------------------------------
-def simulate_features(df):
-    np.random.seed(week * 99)
-    df["elo_diff"] = np.random.normal(0, 100, len(df))
-    df["temp_c"] = np.random.uniform(-5, 25, len(df))
-    df["wind_kph"] = np.random.uniform(0, 25, len(df))
-    df["precip_prob"] = np.random.uniform(0, 1, len(df))
-    return df
-
-week_df = simulate_features(week_df)
-X = week_df[MODEL_FEATURES].astype(float)
-week_df["home_win_prob"] = model.predict_proba(X)[:,1]
-week_df["predicted_spread"] = np.round(-7 * (week_df["home_win_prob"] - 0.5), 1)
-week_df["predicted_total"] = np.round(45 + np.random.normal(0, 3, len(week_df)), 1)
-
-# --------------------------------------------------------------
-# 🧮 Helper - Robust spread parser
+# 🧮 Utilities
 # --------------------------------------------------------------
 def parse_spread(value):
     if not isinstance(value, str) or value in ["N/A", "", None]:
         return np.nan
     try:
-        # Remove team names and symbols, keep numeric part
         num = ''.join(ch for ch in value if ch in "+-.0123456789")
         if num == "" or num == ".":
             return np.nan
@@ -197,15 +118,82 @@ def parse_spread(value):
     except Exception:
         return np.nan
 
+def simulate_features(df, week):
+    np.random.seed(week * 123)
+    df["elo_diff"] = np.random.normal(0, 100, len(df))
+    df["temp_c"] = np.random.uniform(-5, 25, len(df))
+    df["wind_kph"] = np.random.uniform(0, 25, len(df))
+    df["precip_prob"] = np.random.uniform(0, 1, len(df))
+    df["over_under"] = df["over_under"].fillna(
+        np.clip(45 + (df["elo_diff"]/100)*2 + np.random.normal(0, 2, len(df)), 37, 56)
+    ).round(1)
+    return df
+
 # --------------------------------------------------------------
-# 🎯 Display Game Cards
+# 🎛️ Sidebar Controls
+# --------------------------------------------------------------
+st.sidebar.header("🏈 DJBets NFL Predictor")
+season = st.sidebar.selectbox("Season", [2026, 2025, 2024], index=1)
+week = st.sidebar.selectbox("Week", list(range(1, MAX_WEEKS+1)), index=0)
+
+# --------------------------------------------------------------
+# 📊 Data Load
+# --------------------------------------------------------------
+model = load_or_train_model()
+sched = fetch_schedule(season)
+sched["kickoff_et"] = pd.to_datetime(sched["kickoff_et"], errors="coerce")
+week_df = sched.query("week == @week").copy()
+
+if week_df.empty:
+    st.warning("No games found for this week.")
+    st.stop()
+
+st.title(f"🏈 DJBets NFL Predictor — Week {week} ({season})")
+
+# --------------------------------------------------------------
+# 🔮 Feature Engineering
+# --------------------------------------------------------------
+week_df = simulate_features(week_df, week)
+X = week_df[MODEL_FEATURES].astype(float)
+week_df["home_win_prob"] = model.predict_proba(X)[:,1]
+week_df["predicted_spread"] = np.round(-7 * (week_df["home_win_prob"] - 0.5), 1)
+week_df["predicted_total"] = np.round(
+    week_df["over_under"] + np.random.normal(0, 2, len(week_df)), 1
+)
+
+# --------------------------------------------------------------
+# 📈 Record Tracker
+# --------------------------------------------------------------
+completed = week_df.query("state == 'post' and home_score == home_score and away_score == away_score").copy()
+if not completed.empty:
+    completed["predicted_winner"] = np.where(completed["home_win_prob"] >= 0.5, "home", "away")
+    completed["actual_winner"] = np.where(completed["home_score"] > completed["away_score"], "home", "away")
+    completed["correct"] = completed["predicted_winner"] == completed["actual_winner"]
+    wins = int(completed["correct"].sum())
+    total = len(completed)
+    losses = total - wins
+    acc = wins / total * 100 if total > 0 else 0
+else:
+    wins, losses, acc, total = 0, 0, 0, 0
+
+st.sidebar.markdown("### 📊 Model Performance")
+st.sidebar.metric("Record", f"{wins}-{losses}")
+st.sidebar.metric("Accuracy", f"{acc:.1f}%")
+if total > 0:
+    fig, ax = plt.subplots(figsize=(2.5, 1.2))
+    ax.bar(["Correct", "Incorrect"], [wins, losses], color=["green", "red"])
+    ax.set_xticklabels(["✅ Correct", "❌ Wrong"])
+    ax.set_title("Prediction Breakdown")
+    st.sidebar.pyplot(fig)
+
+# --------------------------------------------------------------
+# 🎯 Display Games
 # --------------------------------------------------------------
 for _, row in week_df.iterrows():
     vegas_spread = parse_spread(row["spread"])
-    bg = "rgba(0, 150, 0, 0.1)" if row["home_win_prob"] > 0.55 else "rgba(150, 0, 0, 0.1)"
-
     state = row.get("state", "pre")
-    state_color = {"pre": "🟡 Upcoming", "in": "🟢 Live", "post": "🔵 Final"}.get(state, "⚪ Unknown")
+    color = {"pre": "⬜ Upcoming", "in": "🟢 Live", "post": "🔵 Final"}.get(state, "⚪ Unknown")
+    bg = "rgba(0,150,0,0.08)" if row["home_win_prob"] > 0.55 else "rgba(255,0,0,0.08)"
 
     st.markdown(f'<div style="background-color:{bg}; padding: 1rem; border-radius: 1rem;">', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 3, 1])
@@ -220,42 +208,42 @@ for _, row in week_df.iterrows():
 
     with c2:
         kickoff = row["kickoff_et"].strftime("%a %b %d, %I:%M %p") if pd.notna(row["kickoff_et"]) else "TBD"
-        st.markdown(f"**{state_color}** — {row['status_text']}")
+        st.markdown(f"**{color}** — {row['status_text']}")
         st.markdown(f"**Kickoff:** {kickoff}")
-        st.markdown(f"**Spread:** {row['spread']}  |  **Model Spread:** {row['predicted_spread']:+.1f}")
-        st.markdown(f"**Over/Under:** {row['over_under']}  |  **Model Total:** {row['predicted_total']}")
-        st.progress(row["home_win_prob"], text=f"🏠 Home win probability: {row['home_win_prob']*100:.1f}%")
+        st.markdown(f"**Vegas Spread:** {row['spread']}  |  **Model Spread:** {row['predicted_spread']:+.1f}")
+        st.markdown(f"**Over/Under:** {row['over_under']:.1f}  |  **Model Total:** {row['predicted_total']:.1f}")
 
-        # Only show final score if completed
+        st.progress(row["home_win_prob"], text=f"🏠 Home win probability ({row['home_team']}): {row['home_win_prob']*100:.1f}%")
+        st.caption("🟩 Green = home favorite | 🟥 Red = away favorite")
+
+        # Game result logic
         if state == "post" and not np.isnan(row["home_score"]) and not np.isnan(row["away_score"]):
             actual_winner = "home" if row["home_score"] > row["away_score"] else "away"
             predicted_winner = "home" if row["home_win_prob"] >= 0.5 else "away"
             correct = (actual_winner == predicted_winner)
             result = "✅ Correct prediction" if correct else "❌ Incorrect"
-            st.markdown(f"**Final:** {row['away_score']} - {row['home_score']} ({result})")
+            st.markdown(f"**Final Score:** {row['away_score']} - {row['home_score']} ({result})")
         elif state == "in":
             st.markdown(f"**Live:** {row['status_text']}")
         else:
             st.markdown("⏳ **Not started yet**")
 
-        with st.expander("📊 Detailed Analysis"):
+        with st.expander("📊 Detailed Betting Analysis"):
+            spread_diff = np.nan
             if not np.isnan(vegas_spread):
                 spread_diff = row["predicted_spread"] - vegas_spread
-                spread_recommendation = (
-                    f"Bet **{row['home_team']}** (model expects stronger performance)"
-                    if spread_diff < 0 else f"Bet **{row['away_team']}** (+points value)"
+                spread_rec = (
+                    f"Bet **{row['home_team']}** (model stronger)" if spread_diff < 0
+                    else f"Bet **{row['away_team']}** (+points)"
                 )
             else:
-                spread_recommendation = "No Vegas spread available"
+                spread_rec = "No Vegas spread data"
 
-            if not np.isnan(row["over_under"]):
-                ou_diff = row["predicted_total"] - row["over_under"]
-                ou_recommendation = "Bet **Over**" if ou_diff > 0 else "Bet **Under**"
-            else:
-                ou_recommendation = "No O/U data"
+            ou_diff = row["predicted_total"] - row["over_under"]
+            ou_rec = "Bet **Over**" if ou_diff > 0 else "Bet **Under**"
 
-            st.markdown(f"**Spread Recommendation:** {spread_recommendation}")
-            st.markdown(f"**Over/Under Recommendation:** {ou_recommendation}")
+            st.markdown(f"**Spread Recommendation:** {spread_rec}")
+            st.markdown(f"**Over/Under Recommendation:** {ou_rec}")
 
             feats = {k: row[k] for k in MODEL_FEATURES}
             fig, ax = plt.subplots(figsize=(5, 2))
@@ -263,9 +251,7 @@ for _, row in week_df.iterrows():
             ax.set_title("Model Feature Inputs")
             st.pyplot(fig)
 
-            st.caption(f"Predicted Home Win Prob: {row['home_win_prob']*100:.1f}%")
-
     st.markdown("</div><br>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("🏈 DJBets NFL Predictor v10.6 — live status, final results, spread/O-U analysis.")
+st.caption("🏈 DJBets NFL Predictor v10.8 — now with transparent performance tracking and clearer visuals.")
