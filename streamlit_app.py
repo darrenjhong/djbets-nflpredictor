@@ -9,14 +9,14 @@ from bs4 import BeautifulSoup
 import re
 
 # --------------------------------------------------------------
-# 🏗️ PAGE CONFIG
+# PAGE CONFIG
 # --------------------------------------------------------------
 st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
 
 LOGO_DIR = Path(__file__).parent / "public" / "logos"
 
 # --------------------------------------------------------------
-# 🏈 TEAM MAP + LOGOS
+# TEAM NAMES + LOGOS
 # --------------------------------------------------------------
 TEAM_FULL_NAMES = {
     "ARI": "Cardinals", "ATL": "Falcons", "BAL": "Ravens", "BUF": "Bills",
@@ -32,19 +32,22 @@ TEAM_FULL_NAMES = {
 TEAM_NAMES = [v for v in TEAM_FULL_NAMES.values()]
 
 def clean_team_name(raw):
-    """Extracts clean team name from SportsOddsHistory strings like '161-91 (63.9%)'."""
+    """Extracts clean team name from SportsOddsHistory cells."""
     if not isinstance(raw, str):
         return None
-    raw = re.sub(r"[^A-Za-z\s]", "", raw).strip()
+    # Remove record strings like (63.9%) and numbers
+    raw = re.sub(r"[\(\)\d\-%\.]", "", raw).strip()
     for name in TEAM_NAMES:
         if name.lower() in raw.lower():
             return name
-    # fallback heuristic: first word if valid
-    word = raw.split()[0] if raw else None
-    return word.capitalize() if word else None
+    # fallback heuristic: first word capitalized
+    parts = raw.split()
+    if parts:
+        return parts[0].capitalize()
+    return None
 
 def get_logo(team_name):
-    """Returns path to logo or fallback image."""
+    """Returns logo path or fallback."""
     if not isinstance(team_name, str):
         return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
     filename = team_name.lower().replace(" ", "") + ".png"
@@ -54,7 +57,7 @@ def get_logo(team_name):
     return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
 # --------------------------------------------------------------
-# 📊 SCRAPER
+# SCRAPER (SportsOddsHistory)
 # --------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_all_history():
@@ -71,7 +74,7 @@ def fetch_all_history():
     for tbl in tables:
         rows = tbl.find_all("tr")[1:]
         for r in rows:
-            cols = [c.text.strip() for c in r.find_all("td")]
+            cols = [c.get_text(" ", strip=True) for c in r.find_all("td")]
             if len(cols) < 7:
                 continue
 
@@ -82,11 +85,9 @@ def fetch_all_history():
             spread = cols[5]
             ou = cols[6]
 
-            # Clean team names
             away_team = clean_team_name(away_raw)
             home_team = clean_team_name(home_raw)
 
-            # Parse score
             try:
                 away_score, home_score = map(int, score_text.split("-"))
             except:
@@ -132,7 +133,7 @@ hist = fetch_all_history()
 st.success(f"✅ Loaded {len(hist)} games from history.")
 
 # --------------------------------------------------------------
-# 🧠 MODEL
+# MODEL TRAINING
 # --------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def train_model(hist):
@@ -152,13 +153,13 @@ def train_model(hist):
 model = train_model(hist)
 
 # --------------------------------------------------------------
-# 🎛️ SIDEBAR
+# SIDEBAR
 # --------------------------------------------------------------
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 
-col_logo1, col_logo2 = st.sidebar.columns([1, 4])
-col_logo1.image(get_logo("Eagles"), width=40)
-col_logo2.markdown("**2025 Season**")
+st.sidebar.divider()
+season = 2025
+week = st.sidebar.selectbox("📅 Select Week", range(1, 19), index=0)
 
 st.sidebar.divider()
 market_weight = st.sidebar.slider("📊 Market Weight", 0.0, 1.0, 0.5, 0.05,
@@ -167,11 +168,9 @@ bet_threshold = st.sidebar.slider("🎯 Bet Threshold", 0.0, 10.0, 3.0, 0.5,
                                   help="Minimum edge required for a bet.")
 weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1,
                                         help="Influence of weather on predictions.")
+
 st.sidebar.divider()
 
-# --------------------------------------------------------------
-# 📈 PERFORMANCE
-# --------------------------------------------------------------
 def compute_model_record(hist, model):
     completed = hist.dropna(subset=["home_score", "away_score"])
     if completed.empty:
@@ -189,9 +188,10 @@ st.sidebar.markdown(f"**Model Record:** {correct}-{incorrect} ({pct:.1f}%)")
 st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
 
 # --------------------------------------------------------------
-# 🏟️ MAIN DISPLAY
+# MAIN VIEW
 # --------------------------------------------------------------
-season, week = 2025, st.sidebar.selectbox("Week", range(1, 19), index=0)
+st.markdown(f"### 🗓️ {season} Week {week}")
+
 week_df = hist[hist["week"] == week].copy()
 if week_df.empty:
     st.warning("⚠️ No games found for this week.")
@@ -200,8 +200,6 @@ if week_df.empty:
 features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
 X = week_df[features].astype(float)
 week_df["home_win_prob_model"] = model.predict_proba(X)[:, 1]
-
-st.markdown(f"### 🗓️ {season} Week {week}")
 
 for _, row in week_df.iterrows():
     home, away = row["home_team"], row["away_team"]
@@ -214,7 +212,7 @@ for _, row in week_df.iterrows():
         c1, c2, c3 = st.columns([2, 1, 2])
         with c1:
             st.image(get_logo(away), width=80)
-            st.markdown(f"**{away}**")
+            st.markdown(f"**{away or 'Unknown'}**")
         with c2:
             st.markdown(
                 f"""
@@ -226,7 +224,7 @@ for _, row in week_df.iterrows():
             )
         with c3:
             st.image(get_logo(home), width=80)
-            st.markdown(f"**{home}**")
+            st.markdown(f"**{home or 'Unknown'}**")
 
         if status == "Final":
             st.markdown(
