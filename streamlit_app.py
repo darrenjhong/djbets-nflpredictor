@@ -54,9 +54,9 @@ def fetch_elo_data():
     try:
         df = pd.read_csv(url, encoding="utf-8", on_bad_lines="skip")
     except Exception as e:
-        st.warning(f"⚠️ Could not load FiveThirtyEight data ({e}); using cached or synthetic fallback.")
+        st.warning(f"⚠️ Could not load FiveThirtyEight data ({e}); using fallback.")
         if cache_path.exists():
-            df = pd.read_csv(cache_path)
+            return pd.read_csv(cache_path)
         else:
             return pd.DataFrame({
                 "season":[2025]*5,
@@ -70,7 +70,7 @@ def fetch_elo_data():
     # Normalize column names
     df.columns = [c.lower().strip() for c in df.columns]
 
-    # Auto-detect date column
+    # Detect date-like column
     date_col = next((c for c in df.columns if "date" in c), None)
     if not date_col:
         st.warning("⚠️ No 'date' column found in Elo file — using today's date.")
@@ -78,15 +78,26 @@ def fetch_elo_data():
     else:
         df["date"] = pd.to_datetime(df[date_col], errors="coerce")
 
-    # Detect key columns
-    for col in ["team1","team2","elo1_pre","elo2_pre","season"]:
-        if col not in df.columns:
-            df[col] = np.nan
+    # Detect possible column names
+    team1_col = next((c for c in df.columns if "team1" in c), "team1")
+    team2_col = next((c for c in df.columns if "team2" in c), "team2")
+    elo1_col = next((c for c in df.columns if "elo1_pre" in c), "elo1_pre")
+    elo2_col = next((c for c in df.columns if "elo2_pre" in c), "elo2_pre")
 
-    df["season"] = pd.to_numeric(df["season"], errors="coerce").fillna(2025).astype(int)
-    df = df[["date","season","team1","team2","elo1_pre","elo2_pre"]]
+    # Ensure existence
+    for c in [team1_col, team2_col, elo1_col, elo2_col]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df["season"] = pd.to_numeric(df.get("season", 2025), errors="coerce").fillna(2025).astype(int)
+    df = df.rename(columns={
+        team1_col: "team1",
+        team2_col: "team2",
+        elo1_col: "elo1_pre",
+        elo2_col: "elo2_pre"
+    })
     df.to_csv(cache_path, index=False)
-    return df
+    return df[["date","season","team1","team2","elo1_pre","elo2_pre"]]
 
 # ==========================================================
 # FETCH SPORTSODDSHISTORY DATA
@@ -136,7 +147,7 @@ def fetch_soh_history():
     return df
 
 # ==========================================================
-# MERGE ELO + ODDS
+# MERGE ELO + ODDS (SAFE)
 # ==========================================================
 def merge_elo(hist, elo):
     hist = hist.copy()
@@ -144,19 +155,33 @@ def merge_elo(hist, elo):
     hist["away_538"] = hist["away_team"].map(NICK_TO_538)
     hist["dkey"] = hist["date"].dt.strftime("%Y-%m-%d")
     elo["dkey"] = elo["date"].dt.strftime("%Y-%m-%d")
-    merged = hist.merge(
-        elo[["dkey","team1","team2","elo1_pre","elo2_pre"]],
-        left_on=["dkey","home_538","away_538"],
-        right_on=["dkey","team2","team1"],
-        how="left"
-    )
-    merged["elo_diff"] = (merged["elo1_pre"] - merged["elo2_pre"]).fillna(0)
+
+    # Safe merge
+    try:
+        merged = hist.merge(
+            elo[["dkey","team1","team2","elo1_pre","elo2_pre"]],
+            left_on=["dkey","home_538","away_538"],
+            right_on=["dkey","team2","team1"],
+            how="left"
+        )
+    except Exception as e:
+        st.warning(f"⚠️ Merge failed ({e}); using approximate Elo by team only.")
+        merged = hist.merge(
+            elo.groupby("team1")[["elo1_pre"]].mean().rename(columns={"elo1_pre":"elo_avg"}).reset_index(),
+            left_on="home_538", right_on="team1", how="left"
+        )
+        merged["elo_diff"] = merged["elo_avg"].fillna(1500) - 1500
+        merged.drop(columns=["team1"], inplace=True, errors="ignore")
+
+    if "elo_diff" not in merged:
+        merged["elo_diff"] = (merged["elo1_pre"] - merged["elo2_pre"]).fillna(0)
+
     merged["inj_diff"] = np.random.uniform(-1,1,len(merged))
     merged["temp_c"] = np.random.uniform(-5,25,len(merged))
     return merged
 
 # ==========================================================
-# LOAD & TRAIN MODEL
+# MODEL + DISPLAY
 # ==========================================================
 with st.spinner("📥 Loading Elo data..."):
     elo = fetch_elo_data()
@@ -180,32 +205,13 @@ def train_model(df):
 
 model = train_model(hist)
 
-# ==========================================================
-# SIDEBAR
-# ==========================================================
 st.sidebar.title("🏈 DJBets NFL Predictor")
 week = st.sidebar.selectbox("📅 Week", range(1,19), index=0)
 st.sidebar.markdown("---")
-market_weight = st.sidebar.slider("📊 Market Weight", 0.0,1.0,0.5,0.05,help="Blends model confidence with market probabilities.")
-bet_threshold = st.sidebar.slider("🎯 Bet Threshold (pp)", 0.0,10.0,3.0,0.5,help="Minimum edge in percentage points to trigger a bet.")
-weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0,2.0,1.0,0.1,help="How much the model adjusts for bad weather.")
+st.sidebar.slider("📊 Market Weight", 0.0,1.0,0.5,0.05)
+st.sidebar.slider("🎯 Bet Threshold", 0.0,10.0,3.0,0.5)
+st.sidebar.slider("🌦️ Weather Sensitivity", 0.0,2.0,1.0,0.1)
 
-def compute_record(df):
-    df = df.dropna(subset=["home_score","away_score"])
-    if df.empty: return 0,0,0
-    X = df[FEATURES]
-    y = (df["home_score"]>df["away_score"]).astype(int)
-    preds = model.predict(X)
-    correct = (preds==y).sum()
-    total = len(y)
-    return correct,total-correct,correct/total*100
-c,i,pct = compute_record(hist)
-st.sidebar.markdown(f"**Model Record:** {c}-{i} ({pct:.1f}%)")
-st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
-
-# ==========================================================
-# MAIN
-# ==========================================================
 st.markdown(f"### 🗓️ Week {week}")
 wk = hist[hist["week"]==week].copy()
 if wk.empty:
