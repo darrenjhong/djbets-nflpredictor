@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
-import difflib
+import re
 
 # --------------------------------------------------------------
 # 🏗️ PAGE CONFIG
@@ -29,24 +29,32 @@ TEAM_FULL_NAMES = {
     "SF": "49ers", "TB": "Buccaneers", "TEN": "Titans", "WAS": "Commanders"
 }
 
-TEAM_NAME_LIST = [v for v in TEAM_FULL_NAMES.values()]
+TEAM_NAMES = [v for v in TEAM_FULL_NAMES.values()]
 
-def normalize_team_name(raw):
-    if not isinstance(raw, str) or raw.strip() == "":
+def clean_team_name(raw):
+    """Extracts clean team name from SportsOddsHistory strings like '161-91 (63.9%)'."""
+    if not isinstance(raw, str):
         return None
-    raw = raw.replace("(", "").replace(")", "").split()[0]
-    match = difflib.get_close_matches(raw, TEAM_NAME_LIST, n=1, cutoff=0.4)
-    return match[0] if match else raw
+    raw = re.sub(r"[^A-Za-z\s]", "", raw).strip()
+    for name in TEAM_NAMES:
+        if name.lower() in raw.lower():
+            return name
+    # fallback heuristic: first word if valid
+    word = raw.split()[0] if raw else None
+    return word.capitalize() if word else None
 
 def get_logo(team_name):
-    name = team_name.lower().replace(" ", "")
-    path = LOGO_DIR / f"{name}.png"
-    if path.exists():
-        return str(path)
+    """Returns path to logo or fallback image."""
+    if not isinstance(team_name, str):
+        return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
+    filename = team_name.lower().replace(" ", "") + ".png"
+    logo_path = LOGO_DIR / filename
+    if logo_path.exists():
+        return str(logo_path)
     return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
 # --------------------------------------------------------------
-# 📊 SCRAPER (SportsOddsHistory)
+# 📊 SCRAPER
 # --------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_all_history():
@@ -66,19 +74,23 @@ def fetch_all_history():
             cols = [c.text.strip() for c in r.find_all("td")]
             if len(cols) < 7:
                 continue
+
             date = cols[0]
-            away_team_raw = cols[1]
-            home_team_raw = cols[3]
+            away_raw = cols[1]
+            home_raw = cols[3]
             score_text = cols[4]
             spread = cols[5]
             ou = cols[6]
+
+            # Clean team names
+            away_team = clean_team_name(away_raw)
+            home_team = clean_team_name(home_raw)
+
+            # Parse score
             try:
                 away_score, home_score = map(int, score_text.split("-"))
             except:
                 away_score, home_score = np.nan, np.nan
-
-            away_team = normalize_team_name(away_team_raw)
-            home_team = normalize_team_name(home_team_raw)
 
             games.append({
                 "date": date,
@@ -92,7 +104,7 @@ def fetch_all_history():
 
     df = pd.DataFrame(games)
     if df.empty:
-        st.warning("⚠️ Fallback sample data used.")
+        st.warning("⚠️ Using fallback sample data.")
         df = pd.DataFrame({
             "home_team": ["Eagles", "Chiefs", "Bills"],
             "away_team": ["Cowboys", "Ravens", "Jets"],
@@ -120,7 +132,7 @@ hist = fetch_all_history()
 st.success(f"✅ Loaded {len(hist)} games from history.")
 
 # --------------------------------------------------------------
-# 🧠 MODEL TRAINING
+# 🧠 MODEL
 # --------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def train_model(hist):
@@ -133,9 +145,7 @@ def train_model(hist):
     y = hist["home_win"].astype(int)
     if y.nunique() < 2:
         y = np.random.choice([0, 1], len(y))
-    model = xgb.XGBClassifier(
-        n_estimators=120, learning_rate=0.08, max_depth=4, subsample=0.9, colsample_bytree=0.9
-    )
+    model = xgb.XGBClassifier(n_estimators=120, learning_rate=0.08, max_depth=4, subsample=0.9)
     model.fit(X, y)
     return model
 
@@ -154,13 +164,13 @@ st.sidebar.divider()
 market_weight = st.sidebar.slider("📊 Market Weight", 0.0, 1.0, 0.5, 0.05,
                                   help="Adjust how much Vegas lines influence model predictions.")
 bet_threshold = st.sidebar.slider("🎯 Bet Threshold", 0.0, 10.0, 3.0, 0.5,
-                                  help="Minimum edge (in pp) required for a bet.")
+                                  help="Minimum edge required for a bet.")
 weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1,
-                                        help="Influence of weather on game prediction.")
+                                        help="Influence of weather on predictions.")
 st.sidebar.divider()
 
 # --------------------------------------------------------------
-# 📈 MODEL RECORD
+# 📈 PERFORMANCE
 # --------------------------------------------------------------
 def compute_model_record(hist, model):
     completed = hist.dropna(subset=["home_score", "away_score"])
@@ -172,15 +182,14 @@ def compute_model_record(hist, model):
     y_pred = model.predict(X)
     correct = sum(y_true == y_pred)
     total = len(y_true)
-    pct = correct / total * 100 if total > 0 else 0
-    return correct, total - correct, pct
+    return correct, total - correct, (correct / total * 100) if total > 0 else 0.0
 
 correct, incorrect, pct = compute_model_record(hist, model)
 st.sidebar.markdown(f"**Model Record:** {correct}-{incorrect} ({pct:.1f}%)")
 st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
 
 # --------------------------------------------------------------
-# 🏟️ GAME DISPLAY
+# 🏟️ MAIN DISPLAY
 # --------------------------------------------------------------
 season, week = 2025, st.sidebar.selectbox("Week", range(1, 19), index=0)
 week_df = hist[hist["week"] == week].copy()
@@ -201,12 +210,10 @@ for _, row in week_df.iterrows():
     rec = "🏠 Bet Home" if prob > 55 else "🛫 Bet Away" if prob < 45 else "🚫 No Bet"
     status = "Final" if not np.isnan(row["home_score"]) else "Upcoming"
 
-    home_logo, away_logo = get_logo(home), get_logo(away)
-
     with st.expander(f"{away} @ {home} | {status}", expanded=False):
         c1, c2, c3 = st.columns([2, 1, 2])
         with c1:
-            st.image(away_logo, width=80)
+            st.image(get_logo(away), width=80)
             st.markdown(f"**{away}**")
         with c2:
             st.markdown(
@@ -218,7 +225,7 @@ for _, row in week_df.iterrows():
                 """, unsafe_allow_html=True
             )
         with c3:
-            st.image(home_logo, width=80)
+            st.image(get_logo(home), width=80)
             st.markdown(f"**{home}**")
 
         if status == "Final":
