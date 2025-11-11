@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 # PAGE CONFIG
 # --------------------------------------------------------------
 st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
-
 LOGO_DIR = Path(__file__).parent / "public" / "logos"
 
 # --------------------------------------------------------------
@@ -38,9 +37,8 @@ def get_logo(team):
         return str(logo_path)
     return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
-
 # --------------------------------------------------------------
-# SCRAPER (SportsOddsHistory)
+# SCRAPER
 # --------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_all_history():
@@ -66,14 +64,12 @@ def fetch_all_history():
             away_team = away_tag.text.strip() if away_tag else None
             home_team = home_tag.text.strip() if home_tag else None
 
-            # Normalize
             for nickname in TEAM_MAP.keys():
                 if away_team and nickname in away_team.lower():
                     away_team = nickname
                 if home_team and nickname in home_team.lower():
                     home_team = nickname
 
-            # Parse score
             try:
                 away_score, home_score = map(int, cols[4].text.split("-"))
             except:
@@ -93,25 +89,39 @@ def fetch_all_history():
             })
 
     df = pd.DataFrame(games)
+    if df.empty:
+        st.warning("⚠️ Using fallback dataset.")
+        df = pd.DataFrame({
+            "home_team": ["eagles", "chiefs", "bills"],
+            "away_team": ["cowboys", "ravens", "jets"],
+            "home_score": [27, 24, 35],
+            "away_score": [20, 17, 31],
+            "spread": [-3.5, -2.0, -6.5],
+            "over_under": [45.5, 47.0, 48.5]
+        })
+
+    # Clean numeric data
     df["spread"] = pd.to_numeric(df["spread"], errors="coerce")
     df["over_under"] = pd.to_numeric(df["over_under"], errors="coerce")
-
-    # Fill invalid
-    df["spread"] = df["spread"].fillna(pd.Series(np.random.uniform(-6, 6, len(df))))
-    df["over_under"] = df["over_under"].fillna(pd.Series(np.random.uniform(38, 55, len(df))))
-
-    # Simulated metrics
     df["elo_diff"] = np.random.uniform(-100, 100, len(df))
     df["inj_diff"] = np.random.uniform(-1, 1, len(df))
     df["temp_c"] = np.random.uniform(-5, 25, len(df))
     df["week"] = np.tile(range(1, 19), len(df)//18 + 1)[:len(df)]
     df["season"] = 2025
-    return df
 
+    # Fill NaNs with realistic randoms
+    df = df.fillna({
+        "spread": np.random.uniform(-6, 6, len(df)),
+        "over_under": np.random.uniform(38, 55, len(df)),
+        "elo_diff": np.random.uniform(-100, 100, len(df)),
+        "inj_diff": np.random.uniform(-1, 1, len(df)),
+        "temp_c": np.random.uniform(-5, 25, len(df))
+    })
+
+    return df
 
 hist = fetch_all_history()
 st.success(f"✅ Loaded {len(hist)} games from history.")
-
 
 # --------------------------------------------------------------
 # MODEL TRAINING
@@ -120,12 +130,20 @@ st.success(f"✅ Loaded {len(hist)} games from history.")
 def train_model(hist):
     features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
     hist["home_win"] = (hist["home_score"] > hist["away_score"]).astype(int)
-    X = hist[features].astype(float)
-    y = hist["home_win"].astype(int)
-    model = xgb.XGBClassifier(n_estimators=120, learning_rate=0.08, max_depth=4)
+
+    X = hist[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    y = hist.loc[X.index, "home_win"]
+
+    if len(X) < 10:
+        st.warning("⚠️ Not enough valid data — using simulated training set.")
+        X = pd.DataFrame(np.random.randn(100, len(features)), columns=features)
+        y = np.random.randint(0, 2, 100)
+
+    model = xgb.XGBClassifier(
+        n_estimators=120, learning_rate=0.08, max_depth=4, eval_metric="logloss", use_label_encoder=False
+    )
     model.fit(X, y)
     return model
-
 
 model = train_model(hist)
 
@@ -140,7 +158,6 @@ market_weight = st.sidebar.slider("📊 Market Weight", 0.0, 1.0, 0.5, 0.05)
 bet_threshold = st.sidebar.slider("🎯 Bet Threshold", 0.0, 10.0, 3.0, 0.5)
 weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1)
 
-# Model record
 def compute_model_record(hist, model):
     completed = hist.dropna(subset=["home_score", "away_score"])
     if completed.empty:
@@ -158,10 +175,9 @@ st.sidebar.markdown(f"**Model Record:** {correct}-{incorrect} ({pct:.1f}%)")
 st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
 
 # --------------------------------------------------------------
-# MAIN DISPLAY
+# GAME DISPLAY
 # --------------------------------------------------------------
 st.markdown(f"### 🗓️ {season} Week {week}")
-
 week_df = hist[hist["week"] == week].copy()
 if week_df.empty:
     st.warning("⚠️ No games found for this week.")
@@ -171,31 +187,12 @@ features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
 X = week_df[features].astype(float)
 week_df["home_win_prob_model"] = model.predict_proba(X)[:, 1]
 
-# --------------------------------------------------------------
-# VISUALIZATION HELPERS
-# --------------------------------------------------------------
-def plot_elo_trend(team):
-    """Simulated mini Elo trend."""
-    weeks = np.arange(1, 6)
-    trend = np.random.normal(1500, 25, 5)
-    fig, ax = plt.subplots(figsize=(2.5, 1.5))
-    ax.plot(weeks, trend, marker="o", linewidth=1)
-    ax.set_title(f"{team.title()} Elo", fontsize=8)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    st.pyplot(fig, clear_figure=True)
-
 def weather_icon(temp_c):
-    """Returns weather emoji and descriptor."""
     if temp_c <= 0: return "❄️ Cold"
     elif temp_c <= 10: return "🌧️ Cool"
     elif temp_c <= 20: return "⛅ Mild"
     else: return "☀️ Warm"
 
-
-# --------------------------------------------------------------
-# GAME LOOP
-# --------------------------------------------------------------
 for _, row in week_df.iterrows():
     home, away = row["home_team"], row["away_team"]
     spread, ou = row["spread"], row["over_under"]
@@ -209,7 +206,6 @@ for _, row in week_df.iterrows():
         with c1:
             st.image(get_logo(away), width=80)
             st.markdown(f"**{away.title()}**")
-            plot_elo_trend(away)
 
         with c2:
             st.markdown(
@@ -226,7 +222,6 @@ for _, row in week_df.iterrows():
         with c3:
             st.image(get_logo(home), width=80)
             st.markdown(f"**{home.title()}**")
-            plot_elo_trend(home)
 
         if status == "Final":
             st.markdown(
