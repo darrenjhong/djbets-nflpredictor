@@ -7,12 +7,11 @@ from bs4 import BeautifulSoup
 from pathlib import Path
 from datetime import datetime
 import re
-import os
 
 # ==========================================================
-# SETUP
+# CONFIG
 # ==========================================================
-st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
+st.set_page_config(page_title="🏈 DJBets NFL Predictor", layout="wide")
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
@@ -39,82 +38,58 @@ NICK_TO_538 = {
 }
 
 def get_logo(team):
-    if not isinstance(team, str): return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
+    if not isinstance(team, str):
+        return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
     path = LOGO_DIR / f"{team}.png"
     return str(path) if path.exists() else "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
 # ==========================================================
-# FETCH FIVE THIRTY EIGHT ELO
+# FETCH ELO FROM FIVETHIRTYEIGHT
 # ==========================================================
 @st.cache_data(show_spinner=False)
 def fetch_elo_data():
-    cache_path = DATA_DIR / "nfl_elo_cache.csv"
     url = "https://projects.fivethirtyeight.com/nfl-api/nfl_elo.csv"
-
-    # Try using cached version first
-    if cache_path.exists():
-        try:
-            df = pd.read_csv(cache_path)
-            if not df.empty:
-                return df
-        except Exception:
-            pass
+    cache_path = DATA_DIR / "nfl_elo_cache.csv"
 
     try:
         df = pd.read_csv(url, encoding="utf-8", on_bad_lines="skip")
     except Exception as e:
-        try:
-            df = pd.read_csv(url, engine="python", encoding_errors="ignore", on_bad_lines="skip")
-        except Exception as e2:
-            st.warning(f"⚠️ Could not parse Elo CSV: {e2}. Using fallback synthetic data.")
-            df = pd.DataFrame({
-                "date": pd.date_range("2025-09-01", periods=5),
-                "season": [2025]*5,
-                "team1": ["KC","BUF","DAL","PHI","SF"],
-                "team2": ["CIN","MIA","NYJ","GB","LAR"],
-                "elo1_pre": [1600,1570,1550,1620,1610],
-                "elo2_pre": [1550,1540,1500,1590,1600],
+        st.warning(f"⚠️ Could not load FiveThirtyEight data ({e}); using cached or synthetic fallback.")
+        if cache_path.exists():
+            df = pd.read_csv(cache_path)
+        else:
+            return pd.DataFrame({
+                "season":[2025]*5,
+                "team1":["KC","BUF","PHI","DAL","SF"],
+                "team2":["CIN","MIA","GB","NYJ","LAR"],
+                "elo1_pre":[1600,1570,1620,1550,1610],
+                "elo2_pre":[1550,1540,1590,1500,1600],
+                "date":pd.date_range("2025-09-01", periods=5)
             })
-            return df
 
-    # Standardize expected columns
+    # Normalize column names
     df.columns = [c.lower().strip() for c in df.columns]
-    rename_map = {
-        "date":"date","season":"season",
-        "team1":"team1","team2":"team2",
-        "elo1_pre":"elo1_pre","elo2_pre":"elo2_pre"
-    }
-    missing_cols = [c for c in rename_map if c not in df.columns]
-    if missing_cols:
-        # Try to auto-detect columns
-        possible_cols = list(df.columns)
-        for key in rename_map:
-            for col in possible_cols:
-                if key in col:
-                    rename_map[key] = col
-                    break
 
-    try:
-        df = df[[rename_map[k] for k in rename_map if rename_map[k] in df.columns]].copy()
-    except Exception:
-        st.warning("⚠️ Elo file missing expected columns, using fallback.")
-        df = pd.DataFrame({
-            "date": pd.date_range("2025-09-01", periods=5),
-            "season": [2025]*5,
-            "team1": ["KC","BUF","DAL","PHI","SF"],
-            "team2": ["CIN","MIA","NYJ","GB","LAR"],
-            "elo1_pre": [1600,1570,1550,1620,1610],
-            "elo2_pre": [1550,1540,1500,1590,1600],
-        })
+    # Auto-detect date column
+    date_col = next((c for c in df.columns if "date" in c), None)
+    if not date_col:
+        st.warning("⚠️ No 'date' column found in Elo file — using today's date.")
+        df["date"] = pd.Timestamp.today()
+    else:
+        df["date"] = pd.to_datetime(df[date_col], errors="coerce")
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["season"] = pd.to_numeric(df["season"], errors="coerce")
-    df.dropna(subset=["date"], inplace=True)
+    # Detect key columns
+    for col in ["team1","team2","elo1_pre","elo2_pre","season"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["season"] = pd.to_numeric(df["season"], errors="coerce").fillna(2025).astype(int)
+    df = df[["date","season","team1","team2","elo1_pre","elo2_pre"]]
     df.to_csv(cache_path, index=False)
     return df
 
 # ==========================================================
-# FETCH SPORTSODDSHISTORY
+# FETCH SPORTSODDSHISTORY DATA
 # ==========================================================
 @st.cache_data(show_spinner=False)
 def fetch_soh_history():
@@ -161,7 +136,7 @@ def fetch_soh_history():
     return df
 
 # ==========================================================
-# MERGE ELO
+# MERGE ELO + ODDS
 # ==========================================================
 def merge_elo(hist, elo):
     hist = hist.copy()
@@ -181,18 +156,15 @@ def merge_elo(hist, elo):
     return merged
 
 # ==========================================================
-# LOAD DATA
+# LOAD & TRAIN MODEL
 # ==========================================================
-with st.spinner("Fetching Elo data..."):
+with st.spinner("📥 Loading Elo data..."):
     elo = fetch_elo_data()
-with st.spinner("Fetching SportsOddsHistory..."):
+with st.spinner("📥 Fetching odds data..."):
     hist = fetch_soh_history()
 if not hist.empty:
     hist = merge_elo(hist, elo)
 
-# ==========================================================
-# MODEL
-# ==========================================================
 FEATURES = ["spread","over_under","elo_diff","temp_c","inj_diff"]
 
 @st.cache_resource
@@ -205,6 +177,7 @@ def train_model(df):
     model = xgb.XGBClassifier(n_estimators=150, learning_rate=0.08, max_depth=4, eval_metric="logloss")
     model.fit(X, y)
     return model
+
 model = train_model(hist)
 
 # ==========================================================
@@ -212,10 +185,10 @@ model = train_model(hist)
 # ==========================================================
 st.sidebar.title("🏈 DJBets NFL Predictor")
 week = st.sidebar.selectbox("📅 Week", range(1,19), index=0)
-st.sidebar.divider()
-market_weight = st.sidebar.slider("📊 Market Weight", 0.0,1.0,0.5,0.05)
-bet_threshold = st.sidebar.slider("🎯 Bet Threshold (pp)", 0.0,10.0,3.0,0.5)
-weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0,2.0,1.0,0.1)
+st.sidebar.markdown("---")
+market_weight = st.sidebar.slider("📊 Market Weight", 0.0,1.0,0.5,0.05,help="Blends model confidence with market probabilities.")
+bet_threshold = st.sidebar.slider("🎯 Bet Threshold (pp)", 0.0,10.0,3.0,0.5,help="Minimum edge in percentage points to trigger a bet.")
+weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0,2.0,1.0,0.1,help="How much the model adjusts for bad weather.")
 
 def compute_record(df):
     df = df.dropna(subset=["home_score","away_score"])
@@ -231,7 +204,7 @@ st.sidebar.markdown(f"**Model Record:** {c}-{i} ({pct:.1f}%)")
 st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
 
 # ==========================================================
-# MAIN DISPLAY
+# MAIN
 # ==========================================================
 st.markdown(f"### 🗓️ Week {week}")
 wk = hist[hist["week"]==week].copy()
