@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
-import re
 
 # --------------------------------------------------------------
 # PAGE CONFIG
@@ -16,48 +15,31 @@ st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
 LOGO_DIR = Path(__file__).parent / "public" / "logos"
 
 # --------------------------------------------------------------
-# TEAM NAMES + LOGOS
+# TEAM MAPPING
 # --------------------------------------------------------------
-TEAM_FULL_NAMES = {
-    "ARI": "Cardinals", "ATL": "Falcons", "BAL": "Ravens", "BUF": "Bills",
-    "CAR": "Panthers", "CHI": "Bears", "CIN": "Bengals", "CLE": "Browns",
-    "DAL": "Cowboys", "DEN": "Broncos", "DET": "Lions", "GB": "Packers",
-    "HOU": "Texans", "IND": "Colts", "JAX": "Jaguars", "KC": "Chiefs",
-    "LV": "Raiders", "LAC": "Chargers", "LAR": "Rams", "MIA": "Dolphins",
-    "MIN": "Vikings", "NE": "Patriots", "NO": "Saints", "NYG": "Giants",
-    "NYJ": "Jets", "PHI": "Eagles", "PIT": "Steelers", "SEA": "Seahawks",
-    "SF": "49ers", "TB": "Buccaneers", "TEN": "Titans", "WAS": "Commanders"
+TEAM_MAP = {
+    "49ers": "49ers", "bears": "bears", "bengals": "bengals", "bills": "bills",
+    "broncos": "broncos", "browns": "browns", "buccaneers": "buccaneers", "cardinals": "cardinals",
+    "chargers": "chargers", "chiefs": "chiefs", "colts": "colts", "commanders": "commanders",
+    "cowboys": "cowboys", "dolphins": "dolphins", "eagles": "eagles", "falcons": "falcons",
+    "giants": "giants", "jaguars": "jaguars", "jets": "jets", "lions": "lions",
+    "packers": "packers", "panthers": "panthers", "patriots": "patriots", "raiders": "raiders",
+    "rams": "rams", "ravens": "ravens", "saints": "saints", "seahawks": "seahawks",
+    "steelers": "steelers", "texans": "texans", "titans": "titans", "vikings": "vikings"
 }
 
-TEAM_NAMES = [v for v in TEAM_FULL_NAMES.values()]
-
-def clean_team_name(raw):
-    """Extracts clean team name from SportsOddsHistory cells."""
-    if not isinstance(raw, str):
-        return None
-    # Remove record strings like (63.9%) and numbers
-    raw = re.sub(r"[\(\)\d\-%\.]", "", raw).strip()
-    for name in TEAM_NAMES:
-        if name.lower() in raw.lower():
-            return name
-    # fallback heuristic: first word capitalized
-    parts = raw.split()
-    if parts:
-        return parts[0].capitalize()
-    return None
-
-def get_logo(team_name):
-    """Returns logo path or fallback."""
-    if not isinstance(team_name, str):
+def get_logo(team):
+    """Returns local logo path if found, otherwise placeholder."""
+    if not isinstance(team, str):
         return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
-    filename = team_name.lower().replace(" ", "") + ".png"
+    filename = team.lower().replace(" ", "") + ".png"
     logo_path = LOGO_DIR / filename
     if logo_path.exists():
         return str(logo_path)
     return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
 # --------------------------------------------------------------
-# SCRAPER (SportsOddsHistory)
+# SCRAPER — EXTRACTS TEAMS FROM <a> TAGS
 # --------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_all_history():
@@ -74,41 +56,51 @@ def fetch_all_history():
     for tbl in tables:
         rows = tbl.find_all("tr")[1:]
         for r in rows:
-            cols = [c.get_text(" ", strip=True) for c in r.find_all("td")]
+            cols = r.find_all("td")
             if len(cols) < 7:
                 continue
 
-            date = cols[0]
-            away_raw = cols[1]
-            home_raw = cols[3]
-            score_text = cols[4]
-            spread = cols[5]
-            ou = cols[6]
+            # Extract team names from <a> tags inside each column
+            away_tag = cols[1].find("a")
+            home_tag = cols[3].find("a")
+            away_team = away_tag.text.strip() if away_tag else None
+            home_team = home_tag.text.strip() if home_tag else None
 
-            away_team = clean_team_name(away_raw)
-            home_team = clean_team_name(home_raw)
+            # Normalize to nicknames (so 'Chicago Bears' -> 'bears')
+            if away_team:
+                for nickname in TEAM_MAP.keys():
+                    if nickname in away_team.lower():
+                        away_team = nickname
+            if home_team:
+                for nickname in TEAM_MAP.keys():
+                    if nickname in home_team.lower():
+                        home_team = nickname
 
+            # Extract numeric data
             try:
-                away_score, home_score = map(int, score_text.split("-"))
+                away_score, home_score = map(int, cols[4].text.split("-"))
             except:
                 away_score, home_score = np.nan, np.nan
 
+            spread = pd.to_numeric(cols[5].text.replace("PK", "0"), errors="coerce")
+            ou = pd.to_numeric(cols[6].text, errors="coerce")
+
             games.append({
-                "date": date,
+                "date": cols[0].text.strip(),
                 "away_team": away_team,
                 "home_team": home_team,
                 "away_score": away_score,
                 "home_score": home_score,
-                "spread": pd.to_numeric(spread.replace("PK", "0"), errors="coerce"),
-                "over_under": pd.to_numeric(ou, errors="coerce")
+                "spread": spread,
+                "over_under": ou
             })
 
     df = pd.DataFrame(games)
     if df.empty:
-        st.warning("⚠️ Using fallback sample data.")
+        st.warning("⚠️ Using fallback data (scraper failed).")
         df = pd.DataFrame({
-            "home_team": ["Eagles", "Chiefs", "Bills"],
-            "away_team": ["Cowboys", "Ravens", "Jets"],
+            "home_team": ["eagles", "chiefs", "bills"],
+            "away_team": ["cowboys", "ravens", "jets"],
             "home_score": [27, 24, 35],
             "away_score": [20, 17, 31],
             "spread": [-3.5, -2.0, -6.5],
@@ -120,13 +112,14 @@ def fetch_all_history():
             "season": [2025]*3
         })
     else:
-        df["spread"] = df["spread"].fillna(pd.Series(np.random.uniform(-6, 6, len(df))))
-        df["over_under"] = df["over_under"].fillna(pd.Series(np.random.uniform(38, 55, len(df))))
         df["elo_diff"] = np.random.uniform(-100, 100, len(df))
         df["inj_diff"] = np.random.uniform(-1, 1, len(df))
         df["temp_c"] = np.random.uniform(-5, 25, len(df))
+        df["spread"] = df["spread"].fillna(np.random.uniform(-6, 6, len(df)))
+        df["over_under"] = df["over_under"].fillna(np.random.uniform(38, 55, len(df)))
         df["week"] = np.tile(range(1, 19), len(df)//18 + 1)[:len(df)]
         df["season"] = 2025
+
     return df
 
 hist = fetch_all_history()
@@ -138,15 +131,10 @@ st.success(f"✅ Loaded {len(hist)} games from history.")
 @st.cache_resource(show_spinner=False)
 def train_model(hist):
     features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
-    for f in features:
-        if f not in hist.columns:
-            hist[f] = np.random.uniform(-1, 1, len(hist))
     hist["home_win"] = (hist["home_score"] > hist["away_score"]).astype(int)
     X = hist[features].astype(float)
     y = hist["home_win"].astype(int)
-    if y.nunique() < 2:
-        y = np.random.choice([0, 1], len(y))
-    model = xgb.XGBClassifier(n_estimators=120, learning_rate=0.08, max_depth=4, subsample=0.9)
+    model = xgb.XGBClassifier(n_estimators=120, learning_rate=0.08, max_depth=4)
     model.fit(X, y)
     return model
 
@@ -157,7 +145,6 @@ model = train_model(hist)
 # --------------------------------------------------------------
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 
-st.sidebar.divider()
 season = 2025
 week = st.sidebar.selectbox("📅 Select Week", range(1, 19), index=0)
 
@@ -169,14 +156,11 @@ bet_threshold = st.sidebar.slider("🎯 Bet Threshold", 0.0, 10.0, 3.0, 0.5,
 weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1,
                                         help="Influence of weather on predictions.")
 
-st.sidebar.divider()
-
 def compute_model_record(hist, model):
     completed = hist.dropna(subset=["home_score", "away_score"])
     if completed.empty:
         return 0, 0, 0.0
-    features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
-    X = completed[features].astype(float)
+    X = completed[["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]].astype(float)
     y_true = (completed["home_score"] > completed["away_score"]).astype(int)
     y_pred = model.predict(X)
     correct = sum(y_true == y_pred)
@@ -184,11 +168,12 @@ def compute_model_record(hist, model):
     return correct, total - correct, (correct / total * 100) if total > 0 else 0.0
 
 correct, incorrect, pct = compute_model_record(hist, model)
+st.sidebar.divider()
 st.sidebar.markdown(f"**Model Record:** {correct}-{incorrect} ({pct:.1f}%)")
 st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
 
 # --------------------------------------------------------------
-# MAIN VIEW
+# MAIN DISPLAY
 # --------------------------------------------------------------
 st.markdown(f"### 🗓️ {season} Week {week}")
 
@@ -197,8 +182,7 @@ if week_df.empty:
     st.warning("⚠️ No games found for this week.")
     st.stop()
 
-features = ["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]
-X = week_df[features].astype(float)
+X = week_df[["spread", "over_under", "elo_diff", "temp_c", "inj_diff"]].astype(float)
 week_df["home_win_prob_model"] = model.predict_proba(X)[:, 1]
 
 for _, row in week_df.iterrows():
@@ -208,11 +192,11 @@ for _, row in week_df.iterrows():
     rec = "🏠 Bet Home" if prob > 55 else "🛫 Bet Away" if prob < 45 else "🚫 No Bet"
     status = "Final" if not np.isnan(row["home_score"]) else "Upcoming"
 
-    with st.expander(f"{away} @ {home} | {status}", expanded=False):
+    with st.expander(f"{away.title()} @ {home.title()} | {status}", expanded=False):
         c1, c2, c3 = st.columns([2, 1, 2])
         with c1:
             st.image(get_logo(away), width=80)
-            st.markdown(f"**{away or 'Unknown'}**")
+            st.markdown(f"**{away.title()}**")
         with c2:
             st.markdown(
                 f"""
@@ -224,11 +208,11 @@ for _, row in week_df.iterrows():
             )
         with c3:
             st.image(get_logo(home), width=80)
-            st.markdown(f"**{home or 'Unknown'}**")
+            st.markdown(f"**{home.title()}**")
 
         if status == "Final":
             st.markdown(
-                f"🏁 **Final Score:** {row['away_score']} - {row['home_score']}  "
+                f"🏁 **Final Score:** {int(row['away_score'])} - {int(row['home_score'])}  "
                 f"({'✅ Correct' if (row['home_score'] > row['away_score'] and prob > 50) or (row['home_score'] < row['away_score'] and prob < 50) else '❌ Wrong'})"
             )
 
