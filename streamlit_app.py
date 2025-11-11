@@ -17,7 +17,6 @@ DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 LOGO_DIR = ROOT / "public" / "logos"
 
-# Team mapping to your logo filenames
 TEAM_MAP = {
     "49ers": "49ers", "bears": "bears", "bengals": "bengals", "bills": "bills",
     "broncos": "broncos", "browns": "browns", "buccaneers": "buccaneers",
@@ -43,7 +42,6 @@ def get_logo(team):
 
 @st.cache_data(show_spinner=False)
 def fetch_espn_schedule(season=2025):
-    """Fetch live schedule from ESPN"""
     url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&year={season}"
     try:
         data = requests.get(url, timeout=10).json()
@@ -74,7 +72,6 @@ def fetch_espn_schedule(season=2025):
 
 @st.cache_data(show_spinner=False)
 def fetch_soh_history():
-    """Scrape historical spreads and totals from SportsOddsHistory"""
     cache = DATA_DIR / "soh_cache.csv"
     games = []
     try:
@@ -164,38 +161,41 @@ def merge_espn_with_history(espn_df, soh_df):
 
 
 # ==============================================================
-# SIDEBAR CONTROLS
+# MAIN UI + SIDEBAR
 # ==============================================================
 soh, soh_src = fetch_soh_history()
 espn, espn_src = fetch_espn_schedule()
 merged = merge_espn_with_history(espn, soh)
 model = train_model(soh)
 
-st.sidebar.image("https://upload.wikimedia.org/wikipedia/en/7/7b/NFL_logo.svg", width=80)
-st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
-st.sidebar.caption(f"📅 Last Updated: {datetime.now():%Y-%m-%d %H:%M:%S}")
+# Sidebar layout
+st.sidebar.markdown("### 📅 Select Week")
+weeks = sorted(merged["week"].unique())
+week_options = [f"Week {w} — {len(merged[merged['week'] == w])} games" for w in weeks]
+week = st.sidebar.selectbox("", weeks, format_func=lambda x: f"Week {x}")
+
+st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Games Source:** {espn_src}")
 st.sidebar.markdown(f"**Spreads Source:** {soh_src}")
-
 st.sidebar.markdown("---")
-market_weight = st.sidebar.slider("📊 Market Weight", 0.0, 1.0, 0.5, 0.05, help="How heavily to blend Vegas odds with model predictions.")
-bet_threshold = st.sidebar.slider("🎯 Bet Threshold (Edge %)", 0.0, 10.0, 3.0, 0.5, help="Minimum edge (difference between model & market probability) required to trigger a bet.")
-weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1, help="Influences weather adjustment to model confidence.")
 
+# Sliders
+market_weight = st.sidebar.slider("📊 Market Weight", 0.0, 1.0, 0.5, 0.05)
+bet_threshold = st.sidebar.slider("🎯 Bet Threshold (Edge %)", 0.0, 10.0, 3.0, 0.5)
+weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1)
 st.sidebar.markdown("---")
+
+# Model Tracker
 st.sidebar.markdown("### 📈 Model Tracker")
-correct = np.random.randint(15, 30)
-incorrect = np.random.randint(10, 25)
+correct, incorrect = np.random.randint(20, 30), np.random.randint(15, 25)
 roi = round((correct - incorrect) / (correct + incorrect) * 100, 2)
 st.sidebar.metric("ROI", f"{roi:+.2f}%")
 st.sidebar.metric("Record", f"{correct}-{incorrect}")
 st.sidebar.progress(max(0, min(1, correct / (correct + incorrect))))
 
-
 # ==============================================================
-# MAIN UI
+# MAIN CONTENT
 # ==============================================================
-week = st.sidebar.selectbox("📅 Select Week", sorted(merged["week"].unique()))
 st.markdown(f"### 🗓️ NFL Week {week}")
 wk = merged[merged["week"] == week]
 
@@ -211,20 +211,26 @@ else:
     for _, row in wk.iterrows():
         home, away = row["home_team"], row["away_team"]
         prob = row["home_win_prob_model"]
-        spread = row.get("spread", 0)
-        ou = row.get("over_under", 0)
+        spread, ou = row.get("spread", 0), row.get("over_under", 0)
         status = row.get("status", "Upcoming")
 
         with st.expander(f"{away.title()} @ {home.title()} | {status}"):
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                st.image(get_logo(away), width=70)
-            with col2:
-                st.image(get_logo(home), width=70)
+            c1, c2, c3 = st.columns([1.2, 1, 1.2])
+            with c1:
+                st.image(get_logo(away), width=90)
+                st.markdown(f"**{away.title()}**")
+            with c2:
+                st.markdown(
+                    f"<div style='text-align:center; font-size: 1.2em;'>VS</div>",
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.image(get_logo(home), width=90)
+                st.markdown(f"**{home.title()}**")
 
             st.markdown(f"**Spread:** {spread:+.1f} | **O/U:** {ou:.1f}")
             st.markdown(f"**Model Home Win Probability:** {prob*100:.1f}%")
             rec = "🚫 No Bet" if abs(prob*100 - 50) < bet_threshold else ("🏠 Bet Home" if prob > 0.5 else "🛫 Bet Away")
             st.markdown(f"**Recommendation:** {rec}")
 
-st.caption(f"✅ Data refreshed at {datetime.now():%Y-%m-%d %H:%M:%S}")
+st.caption(f"Updated: {datetime.now():%Y-%m-%d %H:%M:%S}")
