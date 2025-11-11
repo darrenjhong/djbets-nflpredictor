@@ -115,8 +115,14 @@ def fetch_all_history():
         df["elo_diff"] = np.random.uniform(-100, 100, len(df))
         df["inj_diff"] = np.random.uniform(-1, 1, len(df))
         df["temp_c"] = np.random.uniform(-5, 25, len(df))
+        # Convert spread and over/under safely
+        df["spread"] = pd.to_numeric(df["spread"], errors="coerce")
+        df["over_under"] = pd.to_numeric(df["over_under"], errors="coerce")
+
+        # Replace invalid or missing values with realistic defaults
         df["spread"] = df["spread"].fillna(np.random.uniform(-6, 6, len(df)))
         df["over_under"] = df["over_under"].fillna(np.random.uniform(38, 55, len(df)))
+
         df["week"] = np.tile(range(1, 19), len(df)//18 + 1)[:len(df)]
         df["season"] = 2025
 
