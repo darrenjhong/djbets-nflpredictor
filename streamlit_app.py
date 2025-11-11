@@ -44,7 +44,7 @@ def get_logo(team):
     return str(path) if path.exists() else "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
 # ==========================================================
-# FETCH ELO FROM FIVETHIRTYEIGHT
+# FETCH ELO DATA (FiveThirtyEight)
 # ==========================================================
 @st.cache_data(show_spinner=False)
 def fetch_elo_data():
@@ -53,6 +53,9 @@ def fetch_elo_data():
 
     try:
         df = pd.read_csv(url, encoding="utf-8", on_bad_lines="skip")
+        df.columns = [c.lower().strip() for c in df.columns]
+        st.sidebar.markdown("### 🧾 538 Columns:")
+        st.sidebar.write(list(df.columns))
     except Exception as e:
         st.warning(f"⚠️ Could not load FiveThirtyEight data ({e}); using fallback.")
         if cache_path.exists():
@@ -67,10 +70,7 @@ def fetch_elo_data():
                 "date":pd.date_range("2025-09-01", periods=5)
             })
 
-    # Normalize column names
-    df.columns = [c.lower().strip() for c in df.columns]
-
-    # Detect date-like column
+    # Detect a date column
     date_col = next((c for c in df.columns if "date" in c), None)
     if not date_col:
         st.warning("⚠️ No 'date' column found in Elo file — using today's date.")
@@ -78,18 +78,25 @@ def fetch_elo_data():
     else:
         df["date"] = pd.to_datetime(df[date_col], errors="coerce")
 
-    # Detect possible column names
+    # Detect core column names dynamically
     team1_col = next((c for c in df.columns if "team1" in c), "team1")
     team2_col = next((c for c in df.columns if "team2" in c), "team2")
-    elo1_col = next((c for c in df.columns if "elo1_pre" in c), "elo1_pre")
-    elo2_col = next((c for c in df.columns if "elo2_pre" in c), "elo2_pre")
+    elo1_col = next((c for c in df.columns if "elo1_pre" in c or "elo1" in c), "elo1_pre")
+    elo2_col = next((c for c in df.columns if "elo2_pre" in c or "elo2" in c), "elo2_pre")
 
-    # Ensure existence
+    # Guarantee existence of each column
     for c in [team1_col, team2_col, elo1_col, elo2_col]:
         if c not in df.columns:
             df[c] = np.nan
 
-    df["season"] = pd.to_numeric(df.get("season", 2025), errors="coerce").fillna(2025).astype(int)
+    # ✅ Handle season safely
+    if "season" in df.columns:
+        df["season"] = pd.to_numeric(df["season"], errors="coerce").fillna(2025).astype(int)
+    elif "year" in df.columns:
+        df["season"] = pd.to_numeric(df["year"], errors="coerce").fillna(2025).astype(int)
+    else:
+        df["season"] = df["date"].dt.year.fillna(2025).astype(int)
+
     df = df.rename(columns={
         team1_col: "team1",
         team2_col: "team2",
@@ -156,7 +163,6 @@ def merge_elo(hist, elo):
     hist["dkey"] = hist["date"].dt.strftime("%Y-%m-%d")
     elo["dkey"] = elo["date"].dt.strftime("%Y-%m-%d")
 
-    # Safe merge
     try:
         merged = hist.merge(
             elo[["dkey","team1","team2","elo1_pre","elo2_pre"]],
@@ -165,17 +171,12 @@ def merge_elo(hist, elo):
             how="left"
         )
     except Exception as e:
-        st.warning(f"⚠️ Merge failed ({e}); using approximate Elo by team only.")
-        merged = hist.merge(
-            elo.groupby("team1")[["elo1_pre"]].mean().rename(columns={"elo1_pre":"elo_avg"}).reset_index(),
-            left_on="home_538", right_on="team1", how="left"
-        )
-        merged["elo_diff"] = merged["elo_avg"].fillna(1500) - 1500
-        merged.drop(columns=["team1"], inplace=True, errors="ignore")
+        st.warning(f"⚠️ Merge failed ({e}); using fallback average Elo.")
+        merged = hist.copy()
+        merged["elo1_pre"] = 1500
+        merged["elo2_pre"] = 1500
 
-    if "elo_diff" not in merged:
-        merged["elo_diff"] = (merged["elo1_pre"] - merged["elo2_pre"]).fillna(0)
-
+    merged["elo_diff"] = (merged["elo1_pre"] - merged["elo2_pre"]).fillna(0)
     merged["inj_diff"] = np.random.uniform(-1,1,len(merged))
     merged["temp_c"] = np.random.uniform(-5,25,len(merged))
     return merged
