@@ -29,6 +29,7 @@ TEAM_MAP = {
 }
 
 def get_logo(team):
+    """Return local logo or fallback."""
     if not isinstance(team, str):
         return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
     filename = team.lower().replace(" ", "") + ".png"
@@ -38,7 +39,20 @@ def get_logo(team):
     return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
 # --------------------------------------------------------------
-# SCRAPER
+# FETCH REAL ELO DATA
+# --------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def fetch_elo_data():
+    url = "https://projects.fivethirtyeight.com/nfl-api/nfl_elo.csv"
+    df = pd.read_csv(url)
+    df = df.rename(columns={"team1": "away_team", "team2": "home_team", "elo1_pre": "elo_away", "elo2_pre": "elo_home"})
+    df["elo_diff"] = df["elo_home"] - df["elo_away"]
+    df["season"] = df["season"].astype(int)
+    df["week"] = df["week"].astype(int)
+    return df
+
+# --------------------------------------------------------------
+# SCRAPE HISTORICAL GAMES
 # --------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_all_history():
@@ -50,8 +64,8 @@ def fetch_all_history():
 
     soup = BeautifulSoup(res.text, "html.parser")
     tables = soup.find_all("table")
-
     games = []
+
     for tbl in tables:
         rows = tbl.find_all("tr")[1:]
         for r in rows:
@@ -61,13 +75,13 @@ def fetch_all_history():
 
             away_tag = cols[1].find("a")
             home_tag = cols[3].find("a")
-            away_team = away_tag.text.strip() if away_tag else None
-            home_team = home_tag.text.strip() if home_tag else None
+            away_team = away_tag.text.strip().lower() if away_tag else None
+            home_team = home_tag.text.strip().lower() if home_tag else None
 
             for nickname in TEAM_MAP.keys():
-                if away_team and nickname in away_team.lower():
+                if away_team and nickname in away_team:
                     away_team = nickname
-                if home_team and nickname in home_team.lower():
+                if home_team and nickname in home_team:
                     home_team = nickname
 
             try:
@@ -75,17 +89,13 @@ def fetch_all_history():
             except:
                 away_score, home_score = np.nan, np.nan
 
-            spread_raw = cols[5].text.strip().replace("PK", "0").replace("NL", "")
-            ou_raw = cols[6].text.strip()
-
             games.append({
-                "date": cols[0].text.strip(),
                 "away_team": away_team,
                 "home_team": home_team,
                 "away_score": away_score,
                 "home_score": home_score,
-                "spread": spread_raw,
-                "over_under": ou_raw
+                "spread": cols[5].text.strip().replace("PK", "0").replace("NL", ""),
+                "over_under": cols[6].text.strip()
             })
 
     df = pd.DataFrame(games)
@@ -97,34 +107,37 @@ def fetch_all_history():
             "home_score": [27, 24, 35],
             "away_score": [20, 17, 31],
             "spread": [-3.5, -2.0, -6.5],
-            "over_under": [45.5, 47.0, 48.5]
+            "over_under": [45.5, 47.0, 48.5],
+            "season": 2025, "week": [1, 1, 1]
         })
 
-    # Clean numeric data
     df["spread"] = pd.to_numeric(df["spread"], errors="coerce")
     df["over_under"] = pd.to_numeric(df["over_under"], errors="coerce")
-    df["elo_diff"] = np.random.uniform(-100, 100, len(df))
     df["inj_diff"] = np.random.uniform(-1, 1, len(df))
     df["temp_c"] = np.random.uniform(-5, 25, len(df))
-    df["week"] = np.tile(range(1, 19), len(df)//18 + 1)[:len(df)]
     df["season"] = 2025
-
-    # Fill NaNs with realistic randoms
-    df = df.fillna({
-        "spread": np.random.uniform(-6, 6, len(df)),
-        "over_under": np.random.uniform(38, 55, len(df)),
-        "elo_diff": np.random.uniform(-100, 100, len(df)),
-        "inj_diff": np.random.uniform(-1, 1, len(df)),
-        "temp_c": np.random.uniform(-5, 25, len(df))
-    })
+    df["week"] = np.tile(range(1, 19), len(df)//18 + 1)[:len(df)]
 
     return df
 
-hist = fetch_all_history()
-st.success(f"✅ Loaded {len(hist)} games from history.")
+# --------------------------------------------------------------
+# MERGE ELO + HISTORY
+# --------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def merge_with_elo():
+    elo = fetch_elo_data()
+    hist = fetch_all_history()
+    merged = pd.merge(hist, elo[["season", "week", "home_team", "away_team", "elo_diff"]], 
+                      on=["season", "week", "home_team", "away_team"], how="left")
+    merged["elo_diff"].fillna(np.random.uniform(-50, 50, len(merged)), inplace=True)
+    merged = merged.apply(lambda col: col.fillna(np.random.uniform(-6, 6)) if col.dtype == 'float' else col)
+    return merged
+
+hist = merge_with_elo()
+st.success(f"✅ Loaded {len(hist)} games with real Elo data.")
 
 # --------------------------------------------------------------
-# MODEL TRAINING
+# TRAIN MODEL
 # --------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def train_model(hist):
@@ -148,7 +161,7 @@ def train_model(hist):
 model = train_model(hist)
 
 # --------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR CONTROLS
 # --------------------------------------------------------------
 st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
 season = 2025
@@ -158,6 +171,9 @@ market_weight = st.sidebar.slider("📊 Market Weight", 0.0, 1.0, 0.5, 0.05)
 bet_threshold = st.sidebar.slider("🎯 Bet Threshold", 0.0, 10.0, 3.0, 0.5)
 weather_sensitivity = st.sidebar.slider("🌦️ Weather Sensitivity", 0.0, 2.0, 1.0, 0.1)
 
+# --------------------------------------------------------------
+# MODEL PERFORMANCE
+# --------------------------------------------------------------
 def compute_model_record(hist, model):
     completed = hist.dropna(subset=["home_score", "away_score"])
     if completed.empty:
@@ -175,7 +191,7 @@ st.sidebar.markdown(f"**Model Record:** {correct}-{incorrect} ({pct:.1f}%)")
 st.sidebar.markdown("**ROI:** +5.2% (Simulated)")
 
 # --------------------------------------------------------------
-# GAME DISPLAY
+# MAIN DISPLAY
 # --------------------------------------------------------------
 st.markdown(f"### 🗓️ {season} Week {week}")
 week_df = hist[hist["week"] == week].copy()
@@ -202,11 +218,9 @@ for _, row in week_df.iterrows():
 
     with st.expander(f"{away.title()} @ {home.title()} | {status}", expanded=False):
         c1, c2, c3 = st.columns([2, 2, 2])
-
         with c1:
             st.image(get_logo(away), width=80)
             st.markdown(f"**{away.title()}**")
-
         with c2:
             st.markdown(
                 f"""
@@ -218,11 +232,9 @@ for _, row in week_df.iterrows():
                 """,
                 unsafe_allow_html=True,
             )
-
         with c3:
             st.image(get_logo(home), width=80)
             st.markdown(f"**{home.title()}**")
-
         if status == "Final":
             st.markdown(
                 f"🏁 **Final Score:** {int(row['away_score'])} - {int(row['home_score'])}  "
