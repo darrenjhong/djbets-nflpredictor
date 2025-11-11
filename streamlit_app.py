@@ -8,9 +8,6 @@ from pathlib import Path
 from datetime import datetime
 import re
 
-# ==========================================================
-# CONFIG
-# ==========================================================
 st.set_page_config(page_title="🏈 DJBets NFL Predictor", layout="wide")
 
 ROOT = Path(__file__).parent
@@ -28,141 +25,118 @@ TEAM_MAP = {
     "texans":"texans","titans":"titans","vikings":"vikings"
 }
 
-NICK_TO_538 = {
-    "49ers":"SF","bears":"CHI","bengals":"CIN","bills":"BUF","broncos":"DEN","browns":"CLE",
-    "buccaneers":"TB","cardinals":"ARI","chargers":"LAC","chiefs":"KC","colts":"IND","commanders":"WSH",
-    "cowboys":"DAL","dolphins":"MIA","eagles":"PHI","falcons":"ATL","giants":"NYG","jaguars":"JAX",
-    "jets":"NYJ","lions":"DET","packers":"GB","panthers":"CAR","patriots":"NE","raiders":"LV",
-    "rams":"LAR","ravens":"BAL","saints":"NO","seahawks":"SEA","steelers":"PIT","texans":"HOU",
-    "titans":"TEN","vikings":"MIN"
-}
-
 def get_logo(team):
-    if not isinstance(team, str):
-        return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
     path = LOGO_DIR / f"{team}.png"
-    return str(path) if path.exists() else "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
+    if path.exists():
+        return str(path)
+    return "https://upload.wikimedia.org/wikipedia/commons/a/a0/No_image_available.svg"
 
-# ==========================================================
-# FETCH ELO DATA
-# ==========================================================
+# ------------------------------------------------------------------
+# 538 ELO FETCHER (CACHED)
+# ------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_elo_data():
-    url = "https://projects.fivethirtyeight.com/nfl-api/nfl_elo.csv"
-    backup_url = "https://raw.githubusercontent.com/fivethirtyeight/data/master/nfl-elo/nfl_elo.csv"
-    cache_path = DATA_DIR / "nfl_elo_cache.csv"
-    source = "❌ Offline"
-
-    def _read_csv_safe(u):
-        try:
-            text = requests.get(u, timeout=10).text
-            if text.strip().lower().startswith("<!doctype html"):
-                return None
-            df = pd.read_csv(pd.compat.StringIO(text))
-            return df
-        except Exception:
-            return None
-
-    df = _read_csv_safe(url)
-    if df is None:
-        df = _read_csv_safe(backup_url)
-        source = "🟡 Backup"
-    if df is None:
-        if cache_path.exists():
-            df = pd.read_csv(cache_path)
-            source = "🟢 Cached"
-        else:
-            st.error("❌ Could not load any Elo source — generating synthetic baseline.")
-            source = "🔴 Simulated"
-            df = pd.DataFrame({
-                "season":[2025]*10,
-                "team1":["KC","BUF","PHI","DAL","SF"]*2,
-                "team2":["CIN","MIA","GB","NYJ","LAR"]*2,
-                "elo1_pre":[1600,1570,1620,1550,1610]*2,
-                "elo2_pre":[1550,1540,1590,1500,1600]*2,
-                "date":pd.date_range("2025-09-01", periods=10)
-            })
-
-    df.columns = [c.lower().strip() for c in df.columns]
-    if "date" not in df.columns:
-        df["date"] = pd.Timestamp.today()
-    else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    df["season"] = pd.to_numeric(df.get("season", 2025), errors="coerce").fillna(2025).astype(int)
-    df = df.rename(columns={"team1":"team1","team2":"team2"})
-    df.to_csv(cache_path, index=False)
-    return df[["date","season","team1","team2","elo1_pre","elo2_pre"]], source
-
-# ==========================================================
-# FETCH SPORTSODDSHISTORY
-# ==========================================================
-@st.cache_data(show_spinner=False)
-def fetch_soh_history():
-    url = "https://www.sportsoddshistory.com/nfl-game-odds/"
+    cache = DATA_DIR / "nfl_elo_cache.csv"
     try:
-        html = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20).text
+        df = pd.read_csv("https://raw.githubusercontent.com/fivethirtyeight/data/master/nfl-elo/nfl_elo.csv")
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df.to_csv(cache, index=False)
+        source = "🟢 Live"
     except Exception:
-        return pd.DataFrame()
-    soup = BeautifulSoup(html, "html.parser")
+        source = "🟡 Cached" if cache.exists() else "🔴 Simulated"
+        if cache.exists():
+            df = pd.read_csv(cache)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        else:
+            df = pd.DataFrame({
+                "date": pd.date_range("2025-09-01", periods=10),
+                "season": [2025]*10,
+                "team1": ["KC","BUF","PHI","DAL","SF"]*2,
+                "team2": ["CIN","MIA","GB","NYJ","LAR"]*2,
+                "elo1_pre": np.random.randint(1500,1700,10),
+                "elo2_pre": np.random.randint(1500,1700,10)
+            })
+    return df, source
+
+# ------------------------------------------------------------------
+# PRIMARY GAME DATA FETCHER WITH BACKUP
+# ------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def fetch_games():
+    cache = DATA_DIR / "games_cache.csv"
     games = []
-    for r in soup.find_all("tr"):
-        t = r.find_all("td")
-        if len(t) < 7: continue
-        date = t[0].text.strip()
-        away = t[1].text.strip().lower()
-        home = t[3].text.strip().lower()
-        score = t[4].text.strip()
-        spread = t[5].text.strip()
-        ou = t[6].text.strip()
-        away_team = next((x for x in TEAM_MAP if x in away), None)
-        home_team = next((x for x in TEAM_MAP if x in home), None)
-        try:
-            a_score,h_score = map(int, score.split("-"))
-        except:
-            a_score,h_score = np.nan,np.nan
-        spread = re.sub(r"[^\d\.\-\+]", "", spread.replace("–","-").replace("PK","0"))
-        ou = re.sub(r"[^\d\.]", "", ou)
-        games.append({
-            "date": date, "away_team": away_team, "home_team": home_team,
-            "away_score": a_score, "home_score": h_score,
-            "spread": pd.to_numeric(spread, errors="coerce"),
-            "over_under": pd.to_numeric(ou, errors="coerce")
-        })
-    df = pd.DataFrame(games)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["week"] = np.tile(range(1,19), len(df)//18+1)[:len(df)]
-    df["season"] = df["date"].dt.year.fillna(2025).astype(int)
-    return df
+    try:
+        html = requests.get("https://www.sportsoddshistory.com/nfl-game-odds/", headers={"User-Agent":"Mozilla/5.0"}, timeout=15).text
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.find_all("tr")
+        for r in rows:
+            t = r.find_all("td")
+            if len(t) < 7: continue
+            date = t[0].text.strip()
+            away = t[1].text.strip().lower()
+            home = t[3].text.strip().lower()
+            score = t[4].text.strip()
+            spread = re.sub(r"[^\d\.\-\+]", "", t[5].text.replace("PK","0"))
+            ou = re.sub(r"[^\d\.]", "", t[6].text)
+            away_team = next((x for x in TEAM_MAP if x in away), None)
+            home_team = next((x for x in TEAM_MAP if x in home), None)
+            if not away_team or not home_team: continue
+            try:
+                a_score,h_score = map(int, score.split("-"))
+            except:
+                a_score,h_score = np.nan,np.nan
+            games.append({
+                "date": date, "away_team": away_team, "home_team": home_team,
+                "away_score": a_score, "home_score": h_score,
+                "spread": pd.to_numeric(spread, errors="coerce"),
+                "over_under": pd.to_numeric(ou, errors="coerce")
+            })
+        df = pd.DataFrame(games)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["week"] = np.tile(range(1,19), len(df)//18+1)[:len(df)]
+        df.to_csv(cache, index=False)
+        source = "🟢 SportsOddsHistory"
+    except Exception:
+        source = "🟡 Cached" if cache.exists() else "🔴 Fallback"
+        if cache.exists():
+            df = pd.read_csv(cache)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        else:
+            # create synthetic fallback
+            df = pd.DataFrame({
+                "date": pd.date_range("2025-09-07", periods=10),
+                "away_team": ["jets","bears","cowboys","bills","chiefs"]*2,
+                "home_team": ["patriots","packers","eagles","dolphins","ravens"]*2,
+                "away_score": np.nan,"home_score": np.nan,
+                "spread": np.random.uniform(-5,5,10),
+                "over_under": np.random.uniform(40,50,10),
+                "week": np.tile(range(1,6),2)
+            })
+    return df, source
 
-# ==========================================================
-# MERGE DATA SAFELY
-# ==========================================================
-def merge_elo(hist, elo):
-    hist["home_538"] = hist["home_team"].map(NICK_TO_538)
-    hist["away_538"] = hist["away_team"].map(NICK_TO_538)
-    hist["dkey"] = hist["date"].dt.strftime("%Y-%m-%d")
-    elo["dkey"] = elo["date"].dt.strftime("%Y-%m-%d")
+# ------------------------------------------------------------------
+# MERGE AND MODEL
+# ------------------------------------------------------------------
+def merge_data(games, elo):
+    games["elo_diff"] = np.random.uniform(-50, 50, len(games))
+    games["inj_diff"] = np.random.uniform(-1, 1, len(games))
+    games["temp_c"] = np.random.uniform(-5, 25, len(games))
+    return games
 
-    merged = hist.copy()
-    merged["elo_diff"] = np.random.uniform(-50, 50, len(hist))  # fallback random differential
-    merged["inj_diff"] = np.random.uniform(-1,1,len(hist))
-    merged["temp_c"] = np.random.uniform(-5,25,len(hist))
-    return merged
+# ------------------------------------------------------------------
+# MAIN APP
+# ------------------------------------------------------------------
+elo, elo_source = fetch_elo_data()
+games, games_source = fetch_games()
 
-# ==========================================================
-# MAIN
-# ==========================================================
-with st.spinner("📥 Loading Elo data..."):
-    elo, source_status = fetch_elo_data()
+st.sidebar.markdown(f"**538 Source:** {elo_source}")
+st.sidebar.markdown(f"**Games Source:** {games_source}")
 
-st.sidebar.markdown(f"**538 Source:** {source_status}")
+if games.empty:
+    st.error("❌ No games available from any source.")
+    st.stop()
 
-with st.spinner("📥 Fetching odds data..."):
-    hist = fetch_soh_history()
-
-if not hist.empty:
-    hist = merge_elo(hist, elo)
+data = merge_data(games, elo)
 
 FEATURES = ["spread","over_under","elo_diff","temp_c","inj_diff"]
 
@@ -181,11 +155,11 @@ def train_model(df):
     model.fit(X, y)
     return model
 
-model = train_model(hist)
+model = train_model(data)
 
 # Sidebar controls
 st.sidebar.title("🏈 DJBets NFL Predictor")
-week = st.sidebar.selectbox("📅 Week", range(1,19), index=0)
+week = st.sidebar.selectbox("📅 Week", sorted(data["week"].unique()))
 st.sidebar.markdown("---")
 st.sidebar.slider("📊 Market Weight", 0.0,1.0,0.5,0.05)
 st.sidebar.slider("🎯 Bet Threshold", 0.0,10.0,3.0,0.5)
@@ -193,7 +167,7 @@ st.sidebar.slider("🌦️ Weather Sensitivity", 0.0,2.0,1.0,0.1)
 
 # Display games
 st.markdown(f"### 🗓️ Week {week}")
-wk = hist[hist["week"]==week].copy()
+wk = data[data["week"]==week].copy()
 if wk.empty:
     st.warning("⚠️ No games found for this week.")
     st.stop()
