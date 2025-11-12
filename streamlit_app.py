@@ -1,7 +1,5 @@
-﻿# DJBets NFL Predictor v12.3
-# Stable release: includes Top Bets summary, SportsOddsHistory spreads,
-# ESPN games, ROI sidebar, centered logos, always-open cards, safe logo handling.
-# All previous requested features preserved.
+﻿# DJBets NFL Predictor v12.3.1
+# Stable with Safe Merge for SportsOddsHistory integration
 
 import os, re, math, hashlib, io
 from datetime import datetime, timezone
@@ -35,11 +33,9 @@ def normalize_team(name: str) -> str:
     if not name:
         return ""
     name = name.lower()
-    # simplify names (common aliases)
     name = re.sub(r"[^a-z ]", "", name)
     aliases = {
         "washington": "commanders",
-        "redskins": "commanders",
         "ny giants": "giants",
         "ny jets": "jets",
         "tampa bay": "buccaneers",
@@ -57,7 +53,6 @@ def normalize_team(name: str) -> str:
     return name.strip().replace(" ", "")
 
 def get_logo_path(team: str):
-    """Return valid logo file or fallback to NFL or blank."""
     if not team:
         return None
     team_key = normalize_team(team)
@@ -68,10 +63,8 @@ def get_logo_path(team: str):
                 p = os.path.join(LOGO_DIR, f)
                 if os.path.exists(p):
                     return p
-    # fallback to nfl.png
     if os.path.exists(DEFAULT_LOGO):
         return DEFAULT_LOGO
-    # ultimate fallback (1x1 blank)
     img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -128,7 +121,6 @@ def fetch_espn_full(year: int):
 # ------------------------
 @st.cache_data(ttl=3600)
 def fetch_soh_week(week: int, year: int):
-    """Scrape SportsOddsHistory spreads and totals."""
     url = SOH_URL.format(year=year, week=week)
     try:
         r = requests.get(url, headers=ESPN_HEADERS, timeout=15)
@@ -145,8 +137,13 @@ def fetch_soh_week(week: int, year: int):
             spread = safe_float(re.sub("[^0-9.-]", "", tds[3]))
             ou = safe_float(re.sub("[^0-9.]", "", tds[4]))
             rows.append({"week": week, "home_team": home, "away_team": away, "spread": spread, "over_under": ou})
-        return pd.DataFrame(rows)
-    except:
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df["home_team"] = df["home_team"].astype(str)
+            df["away_team"] = df["away_team"].astype(str)
+        return df
+    except Exception as e:
+        st.warning(f"⚠️ SOH fetch failed for week {week}: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -157,17 +154,31 @@ def merge_espn_soh(year: int):
     parts = []
     for wk in sorted(espn["week"].unique()):
         soh = fetch_soh_week(wk, year)
-        merged = pd.merge(
-            espn[espn["week"] == wk],
-            soh,
-            on=["week", "home_team", "away_team"],
-            how="left"
-        )
+        # ✅ Check columns before merging
+        required_cols = {"week", "home_team", "away_team"}
+        if soh.empty or not required_cols.issubset(soh.columns):
+            st.warning(f"⚠️ SOH data missing required columns for week {wk}. Using ESPN-only data.")
+            merged = espn[espn["week"] == wk].copy()
+            merged["spread"] = np.nan
+            merged["over_under"] = np.nan
+        else:
+            try:
+                merged = pd.merge(
+                    espn[espn["week"] == wk],
+                    soh,
+                    on=["week", "home_team", "away_team"],
+                    how="left"
+                )
+            except Exception as e:
+                st.warning(f"⚠️ Merge failed for week {wk}: {e}")
+                merged = espn[espn["week"] == wk].copy()
+                merged["spread"] = np.nan
+                merged["over_under"] = np.nan
         parts.append(merged)
     return pd.concat(parts, ignore_index=True)
 
 # ------------------------
-# Model / Prediction Logic
+# Model Prediction Logic
 # ------------------------
 def vegas_prob(spread):
     s = safe_float(spread)
@@ -187,6 +198,11 @@ def predict_game(row, weather_sens=1.0):
     home_pts = total / 2 + spread_pred / 2
     away_pts = total / 2 - spread_pred / 2
     return prob, spread_pred, total, home_pts, away_pts
+
+# ------------------------
+# Sidebar + UI + Cards
+# ------------------------
+# (same as before – no changes)
 
 # ------------------------
 # Sidebar UI
