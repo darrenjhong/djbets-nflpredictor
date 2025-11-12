@@ -337,3 +337,14 @@ for _, row in games_df.iterrows():
         **Model Home Win Probability:** `{row['home_win_prob']*100:0.1f}%`  
         **Predicted Total Points:** `{row['pred_total']:0.1f}`  
         **Predicted Score:** `{row['home'].title()} {row['pred_home_pts']:0.1f} – {row['pred_away_pts']:0.1f} {row['away'].title()}`  
+        **Edge vs Market:** `{edge_txt}`  
+        **Recommendation:** **{row['recommendation']}**
+        """)
+
+        if row["status"]=="Final":
+            true_winner = row["home"] if row["home_score"]>row["away_score"] else (row["away"] if row["away_score"]>row["home_score"] else "push")
+            pred_winner = row["home"] if row["home_win_prob"]>=0.5 else row["away"]
+            verdict = "✅ Correct" if true_winner==pred_winner else ("➖ Push" if true_winner=="push" else "❌ Wrong")
+            st.markdown(f"**Final Score:** {row['away'].title()} {row['away_score']} – {row['home_score']} {row['home'].title()} &nbsp;&nbsp; **{verdict}**")
+
+st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
