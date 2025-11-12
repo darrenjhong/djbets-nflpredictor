@@ -1,310 +1,207 @@
-# streamlit_app.py — DJBets NFL Predictor v11
-# Full stable release — silent SOH, safe logo loading, all features retained
+# soh_utils.py
+# Helper utilities for ESPN + SOH merging and logo lookups.
+# IMPORTANT: do NOT call streamlit functions here (no st.*). Keep this file purely utility functions.
 
-import os, json, math, warnings, requests, io
+import os
+import re
+import json
+import time
+import math
+import requests
 import pandas as pd
-import numpy as np
-import streamlit as st
-from datetime import datetime, timedelta
-from PIL import Image
-import xgboost as xgb
+from typing import Tuple
 
-# --- General setup ---
-warnings.filterwarnings("ignore")
-st.set_option("logger.level", "error")
-st.set_page_config(page_title="DJBets NFL Predictor", layout="wide", initial_sidebar_state="expanded")
+DATA_DIR = "./data"
 
-THIS_YEAR = datetime.now().year
-DATA_DIR = os.path.join(os.getcwd(), "data")
-PUBLIC_DIRS = [
-    os.path.join(os.getcwd(), "public"),
-    os.path.join(os.getcwd(), "public", "logos"),
-    os.path.join(os.getcwd(), "public", "images"),
-]
+# -------------------------
+# ESPN schedule scraper (simple)
+# -------------------------
+def _normalize_team_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
 
-# --- OddsAPI Key ---
-ODDS_API_KEY = os.getenv("ODDS_API_KEY") or None
-if not ODDS_API_KEY:
-    for f in ["odds_api_key.txt", "ODDS_API_KEY.txt"]:
-        p = os.path.join(DATA_DIR, f)
+def load_espn_schedule(season: int) -> pd.DataFrame:
+    """
+    Load schedule from ESPN public endpoints by season.
+    This is a resilient best-effort function and returns an empty DataFrame on failure.
+    """
+    try:
+        # ESPN has per-week pages; but to keep lightweight we try ESPN scoreboard API for current season
+        # Fallback: if offline, attempt to load ./data/schedule_{season}.csv or json
+        # --- simple fallback check ---
+        local_csv = os.path.join(DATA_DIR, f"schedule_{season}.csv")
+        local_json = os.path.join(DATA_DIR, f"schedule_{season}.json")
+        if os.path.exists(local_csv):
+            df = pd.read_csv(local_csv)
+            return df
+        if os.path.exists(local_json):
+            with open(local_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return pd.DataFrame(data)
+        # Try ESPN scoreboard API for current week range (best-effort)
+        # NOTE: ESPN endpoints change; we attempt basic scoreboard for season and week range 1..18
+        rows = []
+        for wk in range(1, 19):
+            url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week={wk}&season={season}"
+            try:
+                resp = requests.get(url, timeout=6)
+                if resp.status_code != 200:
+                    continue
+                js = resp.json()
+                events = js.get("events", [])
+                for e in events:
+                    competitions = e.get("competitions", [])
+                    if not competitions:
+                        continue
+                    comp = competitions[0]
+                    # determine teams
+                    home = None; away = None; home_score=None; away_score=None
+                    for competitor in comp.get("competitors", []):
+                        if competitor.get("homeAway") == "home":
+                            home = competitor.get("team", {}).get("abbreviation") or competitor.get("team", {}).get("displayName")
+                            home_score = competitor.get("score")
+                        else:
+                            away = competitor.get("team", {}).get("abbreviation") or competitor.get("team", {}).get("displayName")
+                            away_score = competitor.get("score")
+                    kickoff = comp.get("date")
+                    # try extracting spreads and totals from lines (ESPN may include in 'odds' field)
+                    spread = None; over_under = None
+                    odds = comp.get("odds", [])
+                    if odds:
+                        o = odds[0]
+                        spread = o.get("spread")
+                        over_under = o.get("total")
+                    rows.append({
+                        "season": season,
+                        "week": wk,
+                        "home_team": home,
+                        "away_team": away,
+                        "home_score": home_score,
+                        "away_score": away_score,
+                        "kickoff_et": kickoff,
+                        "spread": spread,
+                        "over_under": over_under
+                    })
+            except Exception:
+                continue
+            time.sleep(0.1)
+        df = pd.DataFrame(rows)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# -------------------------
+# SOH (SportsOddsHistory) loader — best-effort local or remote
+# -------------------------
+def load_soh_data(season:int) -> pd.DataFrame:
+    """
+    Load SportsOddsHistory (SOH) pre-downloaded CSV/JSON in /data. If not found or malformed,
+    return empty DataFrame.
+    """
+    possible = [
+        os.path.join(DATA_DIR, f"soh_{season}.csv"),
+        os.path.join(DATA_DIR, f"soh_{season}.json"),
+        os.path.join(DATA_DIR, "soh_all.csv"),
+        os.path.join(DATA_DIR, "soh_all.json")
+    ]
+    for p in possible:
         if os.path.exists(p):
-            with open(p) as fh:
-                ODDS_API_KEY = fh.read().strip()
+            try:
+                if p.endswith(".csv"):
+                    df = pd.read_csv(p)
+                else:
+                    with open(p,"r",encoding="utf-8") as f:
+                        df = pd.DataFrame(json.load(f))
+                # minimal validation
+                req_cols = {"week","home","away","spread","total"}
+                if not req_cols.intersection(set(df.columns)):
+                    # malformed
+                    return pd.DataFrame()
+                return df
+            except Exception:
+                continue
+    return pd.DataFrame()
 
+def merge_espn_soh(espn_df: pd.DataFrame, soh_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge ESPN schedule with SOH spreads when possible.
+    If SOH is empty or missing columns for a given week, fall back to ESPN only.
+    This function tries to be conservative and avoid raising.
+    """
+    if espn_df is None or espn_df.empty:
+        return pd.DataFrame()
+    esp = espn_df.copy()
+    soh = soh_df.copy() if soh_df is not None else pd.DataFrame()
+    # unify column names
+    esp = esp.rename(columns={
+        "home_team":"home_team","away_team":"away_team","kickoff_et":"kickoff_et"
+    })
+    # If SOH present and has week/home/away/spread, merge
+    if not soh.empty:
+        # normalize team abbreviations for join
+        def norm(x):
+            try:
+                if pd.isna(x): return ""
+                return re.sub(r"[^A-Za-z0-9]","", str(x)).lower()
+            except Exception:
+                return ""
+        soh["home_norm"] = soh.get("home", soh.get("home_team", "")).apply(norm) if "home" in soh.columns or "home_team" in soh.columns else soh.get("home", "").apply(norm)
+        soh["away_norm"] = soh.get("away", soh.get("away_team", "")).apply(norm) if "away" in soh.columns or "away_team" in soh.columns else soh.get("away", "").apply(norm)
+        esp["home_norm"] = esp["home_team"].fillna("").apply(norm)
+        esp["away_norm"] = esp["away_team"].fillna("").apply(norm)
+        # merge on week + normalized teams
+        try:
+            merged = pd.merge(esp, soh[["week","home_norm","away_norm","spread","total"]], left_on=["week","home_norm","away_norm"], right_on=["week","home_norm","away_norm"], how="left")
+            # rename total->over_under
+            if "total" in merged.columns:
+                merged = merged.rename(columns={"total":"over_under"})
+            return merged
+        except Exception:
+            # if merge fails, return espn only
+            return esp
+    return esp
 
-# --- Utility Functions ---
-def get_logo_path(team_name):
-    """Safely find a team logo in public/ directories."""
-    if not team_name or not isinstance(team_name, str):
+# -------------------------
+# Logos & filenames
+# -------------------------
+def get_logo_path(team: str) -> str:
+    """
+    Given a team abbreviation / name, return the first local logo path found.
+    Look in common folders (public/logos, public, logos).
+    """
+    if team is None:
         return None
-    slug = (
-        team_name.lower()
-        .replace("&", "and")
-        .replace(".", "")
-        .replace(" ", "_")
-        .strip()
-    )
-    for d in PUBLIC_DIRS:
-        for ext in ["png", "jpg", "jpeg", "svg", "webp"]:
-            path = os.path.join(d, f"{slug}.{ext}")
-            if os.path.exists(path):
-                return path
+    name = str(team).strip()
+    # try common abbr -> file
+    candidates = []
+    abbr = re.sub(r"[^A-Za-z0-9]", "", name).lower()
+    # typical filenames: pats.png, NE.png, newengland.png, patriots.png
+    paths_to_check = [
+        f"./public/logos/{abbr}.png",
+        f"./public/{abbr}.png",
+        f"./logos/{abbr}.png",
+        f"./public/logos/{name}.png",
+        f"./public/{name}.png",
+        f"./logos/{name}.png",
+    ]
+    # Also attempt uppercase abbr
+    paths_to_check += [p.replace(".png", ".svg") for p in paths_to_check]
+    for p in paths_to_check:
+        if os.path.exists(p):
+            return p
+    # not found
     return None
 
-
-def safe_show_logo(path, team_name, width=60):
-    """Safely render logo or fallback to text if broken/missing."""
-    if not path or not os.path.exists(path):
-        st.write(team_name)
-        return
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        img = Image.open(io.BytesIO(data))
-        st.image(img, width=width)
-    except Exception:
-        st.write(team_name)
-
-
-def simple_espn_schedule_scrape(season=THIS_YEAR):
-    """Fetch weekly NFL schedule data from ESPN."""
-    rows = []
-    try:
-        base_url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-        for offset in range(-60, 120, 7):
-            date_str = (datetime.utcnow() + timedelta(days=offset)).strftime("%Y-%m-%d")
-            r = requests.get(base_url, params={"dates": date_str}, timeout=8)
-            j = r.json()
-            for ev in j.get("events", []):
-                comp = ev.get("competitions", [{}])[0]
-                teams = comp.get("competitors", [])
-                home, away = None, None
-                for t in teams:
-                    if t.get("homeAway") == "home":
-                        home = t
-                    else:
-                        away = t
-                if not home or not away:
-                    continue
-                rows.append(
-                    {
-                        "season": comp.get("season", {}).get("year", season),
-                        "week": comp.get("week", 0),
-                        "home_team": home.get("team", {}).get("displayName", "").lower(),
-                        "away_team": away.get("team", {}).get("displayName", "").lower(),
-                        "home_score": pd.to_numeric(home.get("score"), errors="coerce"),
-                        "away_score": pd.to_numeric(away.get("score"), errors="coerce"),
-                        "kickoff_ts": pd.to_datetime(comp.get("date")),
-                        "status": comp.get("status", {}).get("type", {}).get("name", ""),
-                    }
-                )
-        return pd.DataFrame(rows).drop_duplicates()
-    except Exception:
-        return pd.DataFrame()
-
-
-def fetch_oddsapi():
-    """Fetch current and future odds via OddsAPI if key available."""
-    if not ODDS_API_KEY:
-        return pd.DataFrame()
-    try:
-        url = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
-        params = {
-            "apiKey": ODDS_API_KEY,
-            "regions": "us",
-            "markets": "spreads,totals",
-            "oddsFormat": "american",
-        }
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        rows = []
-        for e in data:
-            home = e.get("home_team", "").lower()
-            away = e.get("away_team", "").lower()
-            commence = e.get("commence_time")
-            spread, ou = None, None
-            for b in e.get("bookmakers", []):
-                for m in b.get("markets", []):
-                    if m.get("key") == "spreads":
-                        for o in m.get("outcomes", []):
-                            if o.get("name", "").lower() == home:
-                                spread = o.get("point")
-                    elif m.get("key") == "totals":
-                        for o in m.get("outcomes", []):
-                            if o.get("point"):
-                                ou = o.get("point")
-            rows.append(
-                {"home_team": home, "away_team": away, "spread": spread, "over_under": ou, "commence_time": commence}
-            )
-        return pd.DataFrame(rows)
-    except Exception:
-        return pd.DataFrame()
-
-
-# --- Model ---
-@st.cache_data(show_spinner=False)
-def train_model(df):
-    if df.empty:
-        return None, ["spread", "over_under"]
-    df = df.copy()
-    for c in ["home_score", "away_score", "spread", "over_under"]:
+# -------------------------
+# Helpers to coerce numeric columns
+# -------------------------
+def ensure_numeric_cols(df: pd.DataFrame, cols: list):
+    """Ensure columns exist and are numeric (inplace)."""
+    for c in cols:
         if c not in df.columns:
-            df[c] = np.nan
-    df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
-    df = df.dropna(subset=["home_score", "away_score"])
-    if len(df) < 30:
-        return None, ["spread", "over_under"]
-    X = df[["spread", "over_under"]].fillna(0)
-    y = df["home_win"]
-    try:
-        model = xgb.XGBClassifier(
-            use_label_encoder=False, eval_metric="logloss", n_estimators=100, max_depth=4
-        )
-        model.fit(X, y)
-        return model, ["spread", "over_under"]
-    except Exception:
-        return None, ["spread", "over_under"]
-
-
-def predict_model(model, df, features):
-    if df.empty:
-        return df
-    out = df.copy()
-    if model is None:
-        out["home_win_prob_model"] = 1 / (1 + np.exp(-(-out["spread"].fillna(0) * 0.15)))
-        return out
-    X = out[features].fillna(0)
-    try:
-        out["home_win_prob_model"] = model.predict_proba(X)[:, 1]
-    except Exception:
-        out["home_win_prob_model"] = 1 / (1 + np.exp(-(-out["spread"].fillna(0) * 0.15)))
-    return out
-
-
-def compute_model_record(hist_df, model):
-    if hist_df.empty:
-        return 0, 0, 0.0
-    df = hist_df.dropna(subset=["home_score", "away_score"])
-    if df.empty:
-        return 0, 0, 0.0
-    df = fill_missing_spreads(df)
-    df = predict_model(model, df, ["spread", "over_under"])
-    df["pred_home"] = (df["home_win_prob_model"] >= 0.5).astype(int)
-    df["actual_home"] = (df["home_score"] > df["away_score"]).astype(int)
-    correct = int((df["pred_home"] == df["actual_home"]).sum())
-    total = len(df)
-    return correct, total - correct, correct / total * 100 if total > 0 else 0.0
-
-
-# --- Sidebar ---
-st.sidebar.markdown("## 🏈 DJBets NFL Predictor")
-season = st.sidebar.selectbox("Season", [THIS_YEAR, THIS_YEAR - 1], index=0)
-market_weight = st.sidebar.slider("Market Weight", 0.0, 1.0, 0.5)
-bet_threshold_pp = st.sidebar.slider("Bet Threshold (pp)", 0.0, 10.0, 3.0)
-model_record_box = st.sidebar.empty()
-
-# --- Load data ---
-st.info("Loading schedule from ESPN ...")
-espn = simple_espn_schedule_scrape(season)
-soh = load_soh_data()
-merged = merge_espn_soh(espn, soh, season=season)
-weeks = sorted(merged["week"].dropna().unique().astype(int)) or list(range(1, 19))
-week = st.sidebar.selectbox("📅 Week", weeks, index=0)
-
-# --- Train model ---
-st.info("Training model ...")
-hist = soh.copy()
-model, features = train_model(hist)
-correct, incorrect, pct = compute_model_record(hist, model)
-model_record_box.markdown(f"**Record:** {correct}-{incorrect}  \n**Accuracy:** {pct:.1f}%")
-
-# --- Prepare data ---
-week_df = merged[merged["week"] == week].copy()
-if week_df.empty:
-    st.warning("No games found for this week.")
-    st.stop()
-
-# --- Merge odds ---
-odds_df = fetch_oddsapi()
-if not odds_df.empty:
-    odds_df["home_team"] = odds_df["home_team"].str.lower().str.strip()
-    odds_df["away_team"] = odds_df["away_team"].str.lower().str.strip()
-    week_df["home_team"] = week_df["home_team"].str.lower().str.strip()
-    week_df["away_team"] = week_df["away_team"].str.lower().str.strip()
-    week_df = week_df.merge(
-        odds_df[["home_team", "away_team", "spread", "over_under"]],
-        on=["home_team", "away_team"],
-        how="left",
-        suffixes=("", "_oddsapi"),
-    )
-    week_df["spread"] = week_df["spread_oddsapi"].combine_first(week_df["spread"])
-    week_df["over_under"] = week_df["over_under_oddsapi"].combine_first(week_df["over_under"])
-
-week_df = fill_missing_spreads(week_df)
-week_df = predict_model(model, week_df, features)
-week_df["home_win_prob_market"] = 1 / (1 + np.exp(-(-week_df["spread"] * 0.15)))
-week_df["home_win_prob_blended"] = (
-    week_df["home_win_prob_model"] * (1 - market_weight)
-    + week_df["home_win_prob_market"] * market_weight
-)
-week_df["edge_pp"] = (week_df["home_win_prob_blended"] - week_df["home_win_prob_market"]) * 100
-
-def recommend(r):
-    if abs(r["edge_pp"]) < bet_threshold_pp:
-        return "🚫 No Bet"
-    return f"🛫 Bet {'Home' if r['edge_pp']>0 else 'Away'} ({r['edge_pp']:+.1f} pp)"
-
-week_df["recommendation"] = week_df.apply(recommend, axis=1)
-
-# --- Main UI ---
-st.title(f"🏈 DJBets NFL Predictor — Week {week}")
-st.caption(f"Season {season} | Updated {datetime.now():%Y-%m-%d %H:%M:%S}")
-
-for _, r in week_df.iterrows():
-    away, home = r["away_team"].capitalize(), r["home_team"].capitalize()
-    away_logo, home_logo = get_logo_path(away), get_logo_path(home)
-    kickoff = (
-        pd.to_datetime(r.get("kickoff_ts")).strftime("%a %b %d %H:%M ET")
-        if pd.notna(r.get("kickoff_ts"))
-        else "TBD"
-    )
-
-    with st.expander(f"{away} @ {home} — {kickoff}", expanded=True):
-        c1, c2, c3 = st.columns([1, 3, 3])
-
-        with c1:
-            safe_show_logo(away_logo, away)
-            safe_show_logo(home_logo, home)
-
-        with c2:
-            st.markdown(f"**Spread:** {r['spread']:.1f}  \n**O/U:** {r['over_under']:.1f}")
-            st.markdown(f"**Edge:** {r['edge_pp']:+.1f} pp  \n**Rec:** {r['recommendation']}")
-            st.markdown(f"**Model Prob:** {r['home_win_prob_model']*100:.1f}%  \n**Market Prob:** {r['home_win_prob_market']*100:.1f}%")
-
-        with c3:
-            try:
-                p = r["home_win_prob_model"]
-                margin = - (np.log((1 / p) - 1)) / 0.15 if 0 < p < 1 else 0
-                total = r.get("over_under", 44)
-                home_pts = (total + margin) / 2
-                away_pts = (total - margin) / 2
-                st.markdown(f"**Predicted:** {home_pts:.1f} - {away_pts:.1f}")
-            except Exception:
-                st.write("Predicted: N/A")
-
-            if not pd.isna(r["home_score"]) and not pd.isna(r["away_score"]):
-                correct_pred = (r["home_score"] > r["away_score"]) == (r["home_win_prob_model"] >= 0.5)
-                res = "✅ Correct" if correct_pred else "❌ Wrong"
-                st.markdown(f"**Final:** {int(r['home_score'])}-{int(r['away_score'])} ({res})")
-
-# --- Footer ---
-st.markdown("---")
-st.header("🏆 Top Model Bets of the Week")
-top_bets = week_df.sort_values("edge_pp", ascending=False).head(10)
-if top_bets.empty:
-    st.write("No top bets this week.")
-else:
-    for _, row in top_bets.iterrows():
-        st.write(f"**{row['away_team'].capitalize()} @ {row['home_team'].capitalize()}** — Edge {row['edge_pp']:+.1f} pp → {row['recommendation']}")
-
-st.caption("Data: ESPN + local SOH archive | OddsAPI for current odds | All missing values simulated gracefully.")
+            df[c] = 0.0
+        try:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        except Exception:
+            df[c] = 0.0
