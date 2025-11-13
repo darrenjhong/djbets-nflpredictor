@@ -138,55 +138,60 @@ model, model_status = train_model_from_history(hist_df)
 
 # ---------- Sidebar ----------
 # -----------------------------
-# DJBETS SIDEBAR (LOCKED VERSION A — NO LOGO)
+# DJBETS SIDEBAR — FINAL LOCKED VERSION YOU REQUESTED
 # -----------------------------
 with st.sidebar:
 
-    st.markdown("## 🏈 DJBets NFL Predictor")
+    # Title with bullseye icon
+    st.markdown("## 🎯 DJBets NFL Predictor")
 
-    # WEEK SELECTOR
-    current_week = st.number_input(
+    # --- WEEK SELECTOR (dropdown) ---
+    st.markdown("### 📅 Select Week")
+
+    current_week = st.selectbox(
         "Week",
-        min_value=1,
-        max_value=18,
-        value=current_week if "current_week" in locals() else 1,
-        step=1
+        list(range(1, 19)),
+        index=(current_week - 1) if "current_week" in globals() else 0
     )
 
     st.markdown("---")
+
+    # --- MODEL CONTROLS ---
     st.markdown("### ⚙️ Model Controls")
 
     market_weight = st.slider(
         "Market weight (blend model <> market)",
         0.0, 1.0,
-        value=market_weight if "market_weight" in locals() else 0.5,
-        step=0.05,
+        value=market_weight if "market_weight" in globals() else 0.5,
+        step=0.05
     )
 
     bet_threshold = st.slider(
         "Bet threshold (edge pts)",
         0.0, 15.0,
-        value=bet_threshold if "bet_threshold" in locals() else 4.0,
+        value=bet_threshold if "bet_threshold" in globals() else 4.0,
         step=0.5,
     )
 
     st.markdown("---")
+
+    # --- MODEL RECORD ---
     st.markdown("### 📊 Model Record")
 
-    if "model_record" in globals() and model_record is not None:
-        roi = model_record.get("roi", 0.0)
-        wins = model_record.get("wins", 0)
-        losses = model_record.get("losses", 0)
-        pushes = model_record.get("pushes", 0)
+    if "model_record" in globals() and model_record:
+        roi     = model_record.get("roi", 0.0)
+        wins    = model_record.get("wins", 0)
+        losses  = model_record.get("losses", 0)
+        pushes  = model_record.get("pushes", 0)
 
         st.markdown(
             f"""
             **ROI:** {'🟢' if roi >= 0 else '🔴'} {roi:.1f}%  
-            **Record:** {wins}-{losses}-{pushes}  (W–L–P)
+            **Record:** {wins}-{losses}-{pushes}
             """
         )
     else:
-        st.info("No trained model available. Using Elo fallback.")
+        st.info("No trained model available — Elo fallback active.")
 
 # ---------- Prepare schedule for the chosen week ----------
 def prepare_week_schedule(season: int, week_num: int) -> pd.DataFrame:
