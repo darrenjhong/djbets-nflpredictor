@@ -6,21 +6,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import traceback
-from datetime import datetime
-import os
-from typing import Dict, Tuple
 
-# Local modules (must exist in repo)
-from data_loader import load_or_fetch_schedule, load_historical, load_local_schedule, fetch_espn_week
+from data_loader import load_or_fetch_schedule, load_historical
 from covers_odds import fetch_covers_for_week
-from team_logo_map import lookup_logo, canonical_from_string
-from utils import (
-    compute_simple_elo,
-    get_logo_path,
-    normalize_team_name,
-    compute_roi
-)
-
+from team_logo_map import canonical_team_name
+from utils import get_logo_path, compute_simple_elo, compute_roi
+from model import train_model, predict
 # ML model
 from sklearn.linear_model import LogisticRegression
 
@@ -145,21 +136,18 @@ def train_model_from_history(history: pd.DataFrame):
 model, model_status = train_model_from_history(hist_df)
 
 # ---------- Sidebar ----------
-st.sidebar.markdown("## 🔎 Controls")
-# week selector at top as requested
-if sched_df is not None and not sched_df.empty:
-    weeks = sorted(sched_df["week"].dropna().unique().astype(int).tolist())
-    if not weeks:
-        weeks = list(range(1, MAX_WEEKS+1))
-else:
-    # fallback
-    weeks = sorted(local_sched_df["week"].dropna().unique().astype(int).tolist()) if (local_sched_df is not None and not local_sched_df.empty) else list(range(1, MAX_WEEKS+1))
+with st.sidebar:
+    st.image("public/logo.png", width=120)
+    st.markdown("## DJBets NFL Predictor")
 
-week = st.sidebar.selectbox("📅 Week", weeks, index=0 if weeks else 0)
+    current_week = st.number_input("Week", 1, 18, 1)
 
-st.sidebar.markdown("### ⚙️ Model Settings")
-market_weight = st.sidebar.slider("Market weight (blend model <> market)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
-bet_threshold = st.sidebar.slider("Bet threshold (edge pp)", min_value=0.0, max_value=15.0, value=4.0, step=0.5)
+    st.markdown("### ⚙️ Model Settings")
+    market_weight = st.slider("Market weight", 0.0, 1.0, 0.0)
+    threshold = st.slider("Bet threshold (edge)", 0.0, 15.0, 3.0)
+
+    st.markdown("### Model record")
+    st.write("Record unavailable (using fallback Elo).")
 
 # model record summary (attempt to compute)
 with st.sidebar.expander("Model record", expanded=True):
@@ -223,19 +211,45 @@ def prepare_week_schedule(season: int, week_num: int) -> pd.DataFrame:
 week_sched = prepare_week_schedule(CURRENT_SEASON, int(week))
 
 # Fetch covers odds (best-effort); will be empty DataFrame if fails
-try:
-    covers_df = fetch_covers_for_week(CURRENT_SEASON, int(week))
-    # canonicalize covers team names to compare
-    if not covers_df.empty:
-        covers_df["home_canon"] = covers_df["home"].map(lambda x: canonical_name_for_display(str(x)))
-        covers_df["away_canon"] = covers_df["away"].map(lambda x: canonical_name_for_display(str(x)))
-except Exception:
-    covers_df = pd.DataFrame()
+st.markdown(f"## Week {current_week}")
 
-# If week_sched is empty, show a friendly message and offer to upload schedule.csv
-if week_sched is None or week_sched.empty:
-    st.warning("No schedule found for the selected week. If you'd like, upload `data/schedule.csv` with columns season,week,home_team,away_team or verify ESPN availability.")
-    st.stop()
+week_sched = schedule[schedule["week"] == current_week]
+
+# fetch covers odds
+covers = fetch_covers_for_week(CURRENT_YEAR, current_week)
+
+# merge
+merged = week_sched.merge(
+    covers,
+    how="left",
+    left_on=["home_team", "away_team"],
+    right_on=["home", "away"]
+)
+
+for idx, row in merged.iterrows():
+    with st.container(border=True):
+        col1, col2, col3 = st.columns([1, 1, 2])
+
+        # away
+        col1.image(get_logo_path(row["away_team"]), width=70)
+        col1.markdown(f"### {row['away_team'].replace('_',' ').title()}")
+
+        col2.markdown("# @")
+
+        # home
+        col2.image(get_logo_path(row["home_team"]), width=70)
+        col2.markdown(f"### {row['home_team'].replace('_',' ').title()}")
+
+        # predictions
+        pred = predict(model, row)
+        st.markdown(f"**Home Win %:** {pred['prob']:.1f}%")
+        st.markdown(f"**Vegas Spread:** {row.get('spread','N/A')}")
+        st.markdown(f"**Vegas O/U:** {row.get('over_under','N/A')}")
+
+        if pred["edge"] >= threshold:
+            st.success(f"Recommended: {pred['bet_side']} (edge {pred['edge']:.1f})")
+        else:
+            st.info("No bet")
 
 # ---------- Build display rows with model / market / logos ----------
 display_rows = []
