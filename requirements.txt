@@ -1,19 +1,8 @@
 ﻿streamlit
 pandas
 numpy
-xgboost
-scikit-learn
-matplotlib
 requests
-Pillow
-python-dotenv
 beautifulsoup4
-lxml
-flask
-gunicorn
-tensorflow
-keras
-plotly
-seaborn
-nltk
-python-dateutil
+scikit-learn
+joblib
+xgboost    # optional, fallback to sklearn if not available
