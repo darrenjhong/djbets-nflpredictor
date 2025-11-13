@@ -137,47 +137,56 @@ def train_model_from_history(history: pd.DataFrame):
 model, model_status = train_model_from_history(hist_df)
 
 # ---------- Sidebar ----------
+# -----------------------------
+# DJBETS SIDEBAR (LOCKED VERSION A — NO LOGO)
+# -----------------------------
 with st.sidebar:
-    st.markdown("## DJBets NFL Predictor")
 
-    current_week = st.number_input("Week", 1, 18, 1)
+    st.markdown("## 🏈 DJBets NFL Predictor")
 
-    st.markdown("### ⚙️ Model Settings")
-    market_weight = st.slider("Market weight", 0.0, 1.0, 0.0)
-    threshold = st.slider("Bet threshold (edge)", 0.0, 15.0, 3.0)
+    # WEEK SELECTOR
+    current_week = st.number_input(
+        "Week",
+        min_value=1,
+        max_value=18,
+        value=current_week if "current_week" in locals() else 1,
+        step=1
+    )
 
-    st.markdown("### Model record")
-    st.write("Record unavailable (using fallback Elo).")
+    st.markdown("---")
+    st.markdown("### ⚙️ Model Controls")
 
-# model record summary (attempt to compute)
-with st.sidebar.expander("Model record", expanded=True):
-    if model is None:
-        st.warning(f"No trained model available ({model_status}). Using Elo fallback.")
-        st.text("Historical record unavailable")
+    market_weight = st.slider(
+        "Market weight (blend model <> market)",
+        0.0, 1.0,
+        value=market_weight if "market_weight" in locals() else 0.5,
+        step=0.05,
+    )
+
+    bet_threshold = st.slider(
+        "Bet threshold (edge pts)",
+        0.0, 15.0,
+        value=bet_threshold if "bet_threshold" in locals() else 4.0,
+        step=0.5,
+    )
+
+    st.markdown("---")
+    st.markdown("### 📊 Model Record")
+
+    if "model_record" in globals() and model_record is not None:
+        roi = model_record.get("roi", 0.0)
+        wins = model_record.get("wins", 0)
+        losses = model_record.get("losses", 0)
+        pushes = model_record.get("pushes", 0)
+
+        st.markdown(
+            f"""
+            **ROI:** {'🟢' if roi >= 0 else '🔴'} {roi:.1f}%  
+            **Record:** {wins}-{losses}-{pushes}  (W–L–P)
+            """
+        )
     else:
-        # Evaluate on history quick pass
-        try:
-            # create sample predictions on hist_df (defensive)
-            sample_rows = []
-            for _, r in hist_df.iterrows():
-                h = r.get("home_team"); a = r.get("away_team")
-                if pd.isna(h) or pd.isna(a):
-                    continue
-                eh = elos.get(h, 1500)
-                ea = elos.get(a, 1500)
-                elo_diff = eh - ea
-                sample_rows.append({"elo_diff": elo_diff, "label": 1 if r.get("home_score", 0) > r.get("away_score", 0) else 0})
-            if len(sample_rows) >= 20:
-                eval_df = pd.DataFrame(sample_rows)
-                preds = model.predict(eval_df[["elo_diff"]].values)
-                correct = int((preds == eval_df["label"].values).sum())
-                total = len(eval_df)
-                pct = correct / total * 100.0
-                st.metric("Accuracy (hist)", f"{pct:.1f}%", f"{correct}/{total}")
-            else:
-                st.text("Not enough labeled history for a stable track record.")
-        except Exception:
-            st.text("Unable to compute historical record.")
+        st.info("No trained model available. Using Elo fallback.")
 
 # ---------- Prepare schedule for the chosen week ----------
 def prepare_week_schedule(season: int, week_num: int) -> pd.DataFrame:
@@ -346,84 +355,59 @@ for idx, r in week_sched.iterrows():
     })
 
 # ---------- UI: show games ----------
-st.markdown(f"## Season {CURRENT_SEASON} — Week {week}")
-cols = st.columns([3, 7])  # left quick summary, right main content
+# -----------------------------
+# GAME CARDS — AUTO EXPANDED, TWO COLUMN
+# -----------------------------
+st.markdown(f"## Week {current_week} Games")
 
-# Left summary (model snapshot)
-with cols[0]:
-    st.markdown("### Quick")
-    if model is None:
-        st.write("Model: **Fallback (Elo)**")
-    else:
-        st.write("Model: **Logistic (elo_diff)**")
-        st.write(model_status)
-    st.write(f"Elo teams known: {len(elos)}")
-    st.write("Market weight: ", f"{market_weight:.2f}")
-    st.write("Bet threshold (pp): ", f"{bet_threshold:.1f}")
+if week_sched.empty:
+    st.warning(f"No games found for Week {current_week}.")
+else:
+    cols = st.columns(2)  # two‐column layout
 
-    # ROI / PnL placeholder using compute_roi on history (if possible)
-    try:
-        pnl, bets_made, roi_pct = compute_roi(hist_df, edge_pp_threshold=bet_threshold)
-        st.markdown("### Performance")
-        st.metric("ROI", f"{roi_pct:.2f}%")
-        st.metric("Bets", f"{bets_made}")
-    except Exception:
-        st.text("Performance: N/A")
+    for i, (_, game) in enumerate(week_sched.iterrows()):
+        col = cols[i % 2]  # alternate between left/right
+        with col:
 
-# Right: list of games; expand each card by default
-with cols[1]:
-    for g in display_rows:
-        # card header
-        header_col1, header_col2 = st.columns([1, 6])
-        with header_col1:
-            # show away logo left, home logo right
-            if g["away_logo"]:
-                try:
-                    st.image(g["away_logo"], width=60)
-                except Exception:
-                    st.write("")  # fail quietly for media errors
+            # TEAM LOGOS + NAMES
+            home_logo = lookup_logo(game["home_team"])
+            away_logo = lookup_logo(game["away_team"])
+
+            st.markdown("### " + 
+                        f"{game['away_team']} @ {game['home_team']}")
+
+            c1, c2, c3 = st.columns([1, 1, 1])
+
+            with c1:
+                st.image(away_logo, width=65)
+                st.markdown(f"**{game['away_team']}**")
+
+            with c3:
+                st.image(home_logo, width=65)
+                st.markdown(f"**{game['home_team']}**")
+
+            st.markdown("---")
+
+            # MODEL PREDICTIONS
+            st.markdown(f"**Home Win Probability:** {game['home_win_prob']:.1f}%")
+            st.markdown(f"**Predicted Winner:** {game['predicted_winner']}")
+
+            # ODDS
+            spread = game.get("spread")
+            ou = game.get("over_under")
+
+            st.markdown(f"**Spread (Vegas):** {spread if pd.notna(spread) else 'N/A'}")
+            st.markdown(f"**O/U:** {ou if pd.notna(ou) else 'N/A'}")
+
+            # EDGE + RECOMMENDATION
+            edge = game.get("edge")
+            st.markdown(f"**Edge:** {edge if pd.notna(edge) else 'N/A'}")
+
+            rec = game.get("recommended_bet", None)
+            if rec:
+                st.success(f"**Recommended Bet:** {rec}")
             else:
-                st.write("")  # spacer
-        with header_col2:
-            # team line with '@' indicating home on right
-            away_disp = g["away"].replace("_", " ").title() if g["away"] else "TBD"
-            home_disp = g["home"].replace("_", " ").title() if g["home"] else "TBD"
-            st.markdown(f"**{away_disp} @ {home_disp}**")
-            # status / kickoff
-            if g["status"] and str(g["status"]).lower() != "unknown":
-                st.caption(f"Status: {g['status']}")
-            if g["kickoff"]:
-                st.caption(f"Kickoff: {g['kickoff']}")
-
-        # main body with two columns
-        left, right = st.columns([3, 4])
-        with left:
-            st.write(f"Home Win Probability: **{g['prob_model']*100:.1f}%**")
-            mp_text = f"{g['market_prob']*100:.1f}%" if (g['market_prob'] is not None and not pd.isna(g['market_prob'])) else "N/A"
-            ou_text = f"{g['over_under']}" if not pd.isna(g['over_under']) else "N/A"
-            spread_text = f"{g['spread']}" if not pd.isna(g['spread']) else "N/A"
-            st.write(f"Spread (vegas): **{spread_text}**")
-            st.write(f"O/U: **{ou_text}**")
-            edge_txt = f"{g['edge_pp']:.1f} pp" if (g['edge_pp'] is not None and not pd.isna(g['edge_pp'])) else "N/A"
-            st.write(f"Edge vs market: **{edge_txt}**")
-            st.write(f"Recommendation: **{g['recommendation']}**")
-        with right:
-            # compact visualization: blended probability bar
-            blended = g['blended_prob'] if g['blended_prob'] is not None and not pd.isna(g['blended_prob']) else g['prob_model']
-            # limit to [0,1]
-            blended = max(0.0, min(1.0, blended))
-            st.progress(blended, text=f"Blended: {blended*100:.1f}%")
-            # show final scores if completed (defensive)
-            try:
-                hs = "" if pd.isna(g["home_score"]) else str(g["home_score"])
-                as_ = "" if pd.isna(g["away_score"]) else str(g["away_score"])
-                if hs != "" or as_ != "":
-                    st.write(f"Score: {away_disp} {as_} — {home_disp} {hs}")
-            except Exception:
-                pass
-
-        st.markdown("---")
-
+                st.info("🚫 No Bet")
 st.caption("Tip: put your canonical logos in `public/logos/` using lowercase underscore names (e.g. chicago_bears.png).")
 
 # End of file
