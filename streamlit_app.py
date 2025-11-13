@@ -14,6 +14,7 @@ from utils import get_logo_path, compute_simple_elo, compute_roi
 from model import train_model, predict
 # ML model
 from sklearn.linear_model import LogisticRegression
+from datetime import datetime
 
 # ---------- Config ----------
 CURRENT_SEASON = datetime.now().year
