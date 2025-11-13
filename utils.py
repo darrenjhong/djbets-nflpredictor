@@ -1,117 +1,110 @@
 # utils.py
-# Shared helpers for DJBets NFL Predictor (safe HTTP, Elo, ROI, misc utils)
-
-import requests
+import requests, time, logging
 import pandas as pd
 import numpy as np
-import time
-import traceback
+from datetime import datetime
+from team_logo_map import canonical_from_string, lookup_logo as lookup_logo_internal
 
-# -----------------------------
-# Safe HTTP request wrapper
-# -----------------------------
-def safe_request_json(url, params=None, retries=3, timeout=10):
-    for attempt in range(retries):
+logger = logging.getLogger("djbets")
+logger.setLevel(logging.INFO)
+
+def safe_request_json(url, params=None, headers=None, timeout=10, max_retries=2, backoff=0.5):
+    """
+    Robust JSON fetch with retries. Returns dict or None on failure.
+    """
+    headers = headers or {"User-Agent": "DJBetsBot/1.0"}
+    for i in range(max_retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            time.sleep(1)
-        except Exception:
-            time.sleep(1)
-    return None
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.debug(f"[safe_request_json] attempt {i} failed: {e}")
+            if i < max_retries:
+                time.sleep(backoff * (2 ** i))
+            else:
+                return None
 
-
-# -----------------------------
-# Simple Elo Calculation
-# -----------------------------
-def compute_simple_elo(df):
+def normalize_team_name(s):
     """
-    Computes simple ELO values based on game outcomes.
-    df must contain:
-    - home_team, away_team
-    - home_score, away_score
+    Return canonical team name (City + Mascot) or None.
+    Uses team_logo_map.canonical_from_string.
     """
+    return canonical_from_string(s)
 
-    if "home_score" not in df.columns or "away_score" not in df.columns:
-        # Fallback for incomplete historical archives (your case)
-        df["home_elo"] = 1500
-        df["away_elo"] = 1500
-        return df
+def get_logo_path(team_name):
+    """
+    team_name: canonical (City + Mascot) or any raw string.
+    Returns local path (string) or None.
+    """
+    if not team_name:
+        return None
+    # if not canonical, try to canonicalize
+    canonical = canonical_from_string(team_name) or team_name
+    return lookup_logo_internal(canonical)
 
-    elo = {}
+# --- SIMPLE ELO helper (very lightweight) ---
+def compute_simple_elo(history_df, k=20, base=1500):
+    """
+    Accepts a historical dataframe with columns:
+       season, week, home_team, away_team, home_score, away_score
+    Returns dataframe with elo_home and elo_away columns (for each game)
+    Very small, incremental ELO calculation per season.
+    """
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
 
-    def get_elo(team):
-        return elo.get(team, 1500)
-
-    def update_elo(team, new_rating):
-        elo[team] = new_rating
-
-    K = 20
-
-    home_elo_list = []
-    away_elo_list = []
-
-    for _, row in df.iterrows():
-        h = row["home_team"]
-        a = row["away_team"]
-
-        h_elo = get_elo(h)
-        a_elo = get_elo(a)
-
-        home_elo_list.append(h_elo)
-        away_elo_list.append(a_elo)
-
-        # Score
-        if row["home_score"] > row["away_score"]:
-            s_home, s_away = 1, 0
-        elif row["home_score"] < row["away_score"]:
-            s_home, s_away = 0, 1
+    df = history_df.copy()
+    df = df.sort_values(["season", "week"]).reset_index(drop=True)
+    teams = {}
+    out_rows = []
+    for _, r in df.iterrows():
+        home = str(r.get("home_team", "")).strip()
+        away = str(r.get("away_team", "")).strip()
+        home_score = r.get("home_score")
+        away_score = r.get("away_score")
+        if pd.isna(home_score) or pd.isna(away_score):
+            # skip unlabeled game for ELO update, but still return current elos
+            h_elo = teams.get(home, base)
+            a_elo = teams.get(away, base)
+            out_rows.append({"home":home, "away":away, "elo_home":h_elo, "elo_away":a_elo})
+            continue
+        h_elo = teams.get(home, base)
+        a_elo = teams.get(away, base)
+        # expected
+        exp_home = 1.0 / (1 + 10 ** ((a_elo - h_elo) / 400))
+        # result
+        if home_score > away_score:
+            s_home = 1.0
+        elif home_score < away_score:
+            s_home = 0.0
         else:
-            s_home, s_away = 0.5, 0.5
+            s_home = 0.5
+        # update
+        h_new = h_elo + k * (s_home - exp_home)
+        a_new = a_elo + k * ((1 - s_home) - (1 - exp_home))
+        teams[home] = h_new
+        teams[away] = a_new
+        out_rows.append({"home":home, "away":away, "elo_home":h_elo, "elo_away":a_elo})
+    return pd.DataFrame(out_rows)
 
-        # Expected probabilities
-        expected_home = 1 / (1 + 10 ** ((a_elo - h_elo) / 400))
-        expected_away = 1 - expected_home
-
-        # Updates
-        new_h = h_elo + K * (s_home - expected_home)
-        new_a = a_elo + K * (s_away - expected_away)
-
-        update_elo(h, new_h)
-        update_elo(a, new_a)
-
-    df["home_elo"] = home_elo_list
-    df["away_elo"] = away_elo_list
-
-    return df
-
-
-# -----------------------------
-# ROI + Model Record
-# -----------------------------
-def compute_roi(df):
+def compute_roi(history_df):
     """
-    Computes:
-    - ROI
-    - PnL
-    - model record: wins/losses
-    Expects df to contain:
-    - recommended (bool)
-    - actual_result (1 if correct, 0 if wrong)
+    Very simple ROI calc: expects 'recommended' boolean and 'result' (1 correct, 0 wrong), 'bet_size' column.
+    Returns pnl, bets_made, roi_percent
     """
-    if "recommended" not in df.columns:
-        return 0, 0, 0
-
+    if history_df is None or history_df.empty:
+        return 0.0, 0, 0.0
+    df = history_df.copy()
+    if "recommended" not in df.columns or "result" not in df.columns:
+        return 0.0, 0, 0.0
     bets = df[df["recommended"] == True]
-
     if bets.empty:
-        return 0, 0, 0
-
-    wins = (bets["actual_result"] == 1).sum()
-    losses = (bets["actual_result"] == 0).sum()
-
-    pnl = wins * 1 - losses * 1  # flat unit betting
-    roi = pnl / max(len(bets), 1)
-
-    return pnl, len(bets), roi
+        return 0.0, 0, 0.0
+    bets["bet_size"] = bets.get("bet_size", 1.0)
+    bets["pnl"] = np.where(bets["result"]==1, bets["bet_size"]*1.0, -bets["bet_size"])
+    pnl = bets["pnl"].sum()
+    bets_made = len(bets)
+    total_staked = (bets["bet_size"]).sum()
+    roi = (pnl / total_staked) * 100 if total_staked>0 else 0.0
+    return float(pnl), int(bets_made), float(roi)

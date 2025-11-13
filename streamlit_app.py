@@ -1,307 +1,215 @@
 # streamlit_app.py
 """
-Main Streamlit app for DJBets NFL Predictor — version: modular v9.5 -> updated
-This file is intended to be a fully-contained Streamlit entrypoint.
-
-Expectations:
-- data/ contains schedule.csv and nfl_archive_10Y.json optionally
-- public/logos/ contains team logo files (png)
-- your Odds API key is optional and not required for Option A (Covers scraping).
+DJBets NFL Predictor - Streamlit app (updated)
+Replace existing file with this one. Expects:
+ - public/logos/<canonical_team_name_lower_underscored>.png (or .jpg)
+ - data/nfl_archive_10Y.json (historical)
+ - optional data/schedule.csv fallback
 """
-import os
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
 import traceback
+from datetime import datetime
+import logging
 
 # local modules
-from data_loader import load_or_fetch_schedule, load_historical, load_local_schedule
+from data_loader import load_or_fetch_schedule, load_historical, load_local_schedule, merge_schedule_and_history
 from covers_odds import fetch_covers_for_week
-from team_logo_map import lookup_logo
-from model import train_model, load_model, predict
-from utils import compute_simple_elo, compute_roi
+from team_logo_map import canonical_from_string, lookup_logo
+from utils import get_logo_path, compute_simple_elo, compute_roi, normalize_team_name
 
 st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
+logger = logging.getLogger("djbets.app")
+logger.setLevel(logging.INFO)
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def safe_read_schedule(season:int):
-    try:
-        df = load_or_fetch_schedule(season)
-        if df is None:
-            return pd.DataFrame()
-        return df
-    except Exception:
-        return pd.DataFrame()
+THIS_YEAR = datetime.now().year
 
-def ensure_cols(df: pd.DataFrame, cols):
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
-    return df
-
-# ---------------------------
+# ------------------
 # Load data
-# ---------------------------
+# ------------------
+@st.cache_data(ttl=600)
+def load_data():
+    hist = load_historical("data/nfl_archive_10Y.json")
+    sched = load_or_fetch_schedule(season=THIS_YEAR, weeks=18)
+    return hist, sched
 
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+hist, sched = load_data()
+if sched is None:
+    sched = pd.DataFrame()
 
-# Sidebar: season + week selection
-THIS_YEAR = int(os.getenv("SEASON_YEAR", datetime.now().year))
-st.sidebar.markdown("## 🏈 DJBets — NFL Predictor")
-# keep the dropdown style you asked for
-season = st.sidebar.selectbox("Season", [THIS_YEAR, THIS_YEAR-1, THIS_YEAR-2], index=0, key="season")
-# We'll populate weeks after loading schedule
-# Placeholders
-MAX_WEEKS = 18
+# canonicalize schedule
+sched = merge_schedule_and_history(sched, hist)
 
-# Load historical
-with st.spinner("Loading historical data..."):
-    hist = load_historical = None
-    try:
-        hist = load_historical()
-        if hist is None or hist.empty:
-            st.info("⚠️ No local historical file found in data/. The app will attempt to fetch scraped historical sources if available, otherwise will use simulated training fallback.")
-            hist = pd.DataFrame()
-        else:
-            st.sidebar.write(f"Historical rows: {len(hist)}")
-    except Exception:
-        hist = pd.DataFrame()
-        st.sidebar.write("Historical load failed.")
+# compute weeks available
+WEEKS = sorted(list(set(int(x) for x in sched["week"].dropna().astype(int))) ) if not sched.empty else list(range(1,19))
 
-# Load schedule
-with st.spinner("Loading schedule..."):
-    sched = safe_read_schedule(season)
-    if sched is None or sched.empty:
-        st.warning("⚠️ No schedule loaded from local file or ESPN for this season.")
-        sched = pd.DataFrame()
+# -----------------------------
+# Sidebar — Minimal UI
+# -----------------------------
+with st.sidebar:
+    st.markdown("## 🏈 DJBets NFL")
 
-# Normalize schedule columns
-for c in ["week","home_team","away_team","start_time","home_score","away_score","game_id"]:
-    if c not in sched.columns:
-        sched[c] = np.nan
+    # --- WEEK SELECTOR ---
+    current_week = st.number_input("Week", min_value=1, max_value=18, value=week, step=1)
 
-# compute weeks list
-weeks = sorted([int(w) for w in pd.unique(sched["week"].dropna().astype(int))]) if not sched.empty else list(range(1, MAX_WEEKS+1))
-if not weeks:
-    weeks = list(range(1, MAX_WEEKS+1))
+    # --- MODEL SLIDERS (minimal style) ---
+    st.markdown("### ⚙️ Model Settings")
 
-week = st.sidebar.selectbox("Week", weeks, index=0, key="week")
+    market_weight = st.slider(
+        "📉 Market Weight",
+        min_value=0.0, max_value=1.0, value=default_market_weight, step=0.05,
+        help="Blend between the model and market lines."
+    )
 
-# ---------------------------
-# Model training (auto-train on first launch)
-# ---------------------------
-with st.spinner("Training model (or loading cached model)..."):
-    model, feature_cols = load_model()
-    trained_here = False
-    if model is None:
-        try:
-            if not hist.empty:
-                # compute Elo if scores available
-                if "home_score" in hist.columns and "away_score" in hist.columns:
-                    hist = compute_simple_elo(hist)
-                model, feature_cols = train_model(hist)
-            if model is None:
-                # fallback: simulated dataset training for a tiny logistic regression
-                sim = pd.DataFrame({
-                    "elo_diff": np.random.normal(0,50,200),
-                    "inj_diff": np.random.normal(0,3,200),
-                    "temp_c": np.random.normal(10,5,200),
-                    "spread": np.random.normal(0,4,200),
-                    "over_under": np.random.normal(45,4,200),
-                    "home_win": (np.random.random(200) > 0.5).astype(int)
-                })
-                model, feature_cols = train_model(sim)
-            trained_here = True
-        except Exception as e:
-            st.error(f"Model training failed: {str(e)}")
-            model = None
-            feature_cols = ["elo_diff","inj_diff","temp_c","spread","over_under"]
+    bet_threshold = st.slider(
+        "🎯 Bet Threshold (points)",
+        min_value=0.0, max_value=15.0, value=default_threshold, step=0.5,
+        help="Minimum required edge to trigger a bet."
+    )
 
-# ---------------------------
-# Pull odds (Covers) for week
-# ---------------------------
-with st.spinner("Fetching odds for week (Covers)..."):
-    try:
-        covers_df = fetch_covers_for_week(season, week)
-    except Exception:
-        covers_df = pd.DataFrame()
-
-# Normalize schedule for display: merge covers odds where possible
-display_sched = sched.copy()
-display_sched["week"] = display_sched["week"].astype(float).fillna(0).astype(int)
-if not covers_df.empty:
-    # try to match teams by name substring (best-effort)
-    def find_odds(row):
-        for _, r in covers_df.iterrows():
-            try:
-                if str(r["home"]).lower() in str(row["home_team"]).lower() or str(row["home_team"]).lower() in str(r["home"]).lower():
-                    return r.get("spread"), r.get("over_under")
-            except Exception:
-                continue
-        return (np.nan, np.nan)
-    s_spread = []
-    s_ou = []
-    for _, r in display_sched.iterrows():
-        sp, ou = find_odds(r)
-        s_spread.append(sp)
-        s_ou.append(ou)
-    display_sched["spread"] = s_spread
-    display_sched["over_under"] = s_ou
-else:
-    display_sched["spread"] = np.nan
-    display_sched["over_under"] = np.nan
-
-# Ensure features present for prediction
-required_features = feature_cols
-for c in required_features:
-    if c not in display_sched.columns:
-        display_sched[c] = 0.0
-
-# If historical Elo exists, try to bring last Elo to upcoming games by averaging team elos
-if not hist.empty and "home_elo_pre" in hist.columns and "away_elo_pre" in hist.columns:
-    # compute latest elo per team
-    last_home = hist.groupby("home_team")["home_elo_pre"].last().to_dict()
-    last_away = hist.groupby("away_team")["away_elo_pre"].last().to_dict()
-    def get_elo_diff(r):
-        h = r.get("home_team")
-        a = r.get("away_team")
-        he = last_home.get(h, 1500) if h in last_home else last_away.get(h, 1500)
-        ae = last_away.get(a, 1500) if a in last_away else last_home.get(a,1500)
-        return he - ae
-    display_sched["elo_diff"] = display_sched.apply(get_elo_diff, axis=1)
-else:
-    # fallback to 0
-    display_sched["elo_diff"] = display_sched.get("elo_diff",0.0).fillna(0.0)
-
-# injuries/weather placeholders
-display_sched["inj_diff"] = display_sched.get("inj_diff",0.0).fillna(0.0)
-display_sched["temp_c"] = display_sched.get("temp_c",0.0).fillna(0.0)
-
-# Filter to selected week
-week_df = display_sched[display_sched["week"]==int(week)].copy() if not display_sched.empty else pd.DataFrame()
-if week_df.empty:
-    st.warning("No games found for this week.")
-else:
-    # prepare features
-    X = week_df[required_features].astype(float).fillna(0.0)
-    try:
-        probs = predict(model, required_features, X)
-        week_df["home_win_prob_model"] = probs
-        week_df["predicted_winner"] = week_df.apply(lambda r: r["home_team"] if r["home_win_prob_model"]>=0.5 else r["away_team"], axis=1)
-    except Exception as e:
-        # feature mismatch — try to add missing columns
-        for c in required_features:
-            if c not in week_df.columns:
-                week_df[c] = 0.0
-        try:
-            probs = predict(model, required_features, week_df[required_features])
-            week_df["home_win_prob_model"] = probs
-            week_df["predicted_winner"] = week_df.apply(lambda r: r["home_team"] if r["home_win_prob_model"]>=0.5 else r["away_team"], axis=1)
-        except Exception as e2:
-            week_df["home_win_prob_model"] = 0.5
-            week_df["predicted_winner"] = week_df["home_team"]
-
-# ---------------------------
-# UI: Main area
-# ---------------------------
-st.markdown("<h1 style='text-align:left'>🏈 DJBets — NFL Predictor</h1>", unsafe_allow_html=True)
-st.write(f"Season {season} — Week {week}")
-
-# Sidebar widgets: model sliders and record info (preserve previous design)
-with st.sidebar.expander("Model Controls & Record", expanded=True):
-    st.markdown("### Model controls")
-    market_weight = st.slider("Market weight (blend model<>market)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-    bet_threshold = st.slider("Bet threshold (edge pp)", min_value=0.0, max_value=15.0, value=3.0, step=0.5)
-    st.markdown("---")
-    # model record
-    if not hist.empty:
-        try:
-            hist2 = hist.copy()
-            if "home_score" in hist2.columns and "away_score" in hist2.columns and "home_win_prob_model" in hist2.columns:
-                hist2["pred"] = (hist2["home_win_prob_model"] >= 0.5).astype(int)
-                hist2["actual"] = (hist2["home_score"] > hist2["away_score"]).astype(int)
-                correct = int((hist2["pred"]==hist2["actual"]).sum())
-                total = hist2.shape[0]
-                st.markdown(f"**Model record:** {correct}/{total} = {correct/total:.1%}")
-            else:
-                st.write("Model track: not enough labeled history.")
-        except Exception:
-            st.write("Model track: N/A")
+    # --- MODEL RECORD (simple, clean) ---
+    if model_record is not None:
+        wins, losses = model_record
+        winrate = wins / max(1, wins + losses) * 100
+        st.markdown(
+            f"**📊 Model Record:** {wins}-{losses} ({winrate:.1f}%)"
+        )
     else:
-        st.write("Model track: no historical file found.")
+        st.markdown("📊 Model Record: *Not available*")
 
-# Main content: game cards
-if not week_df.empty:
-    for idx, row in week_df.iterrows():
-        home = row.get("home_team","HOME")
-        away = row.get("away_team","AWAY")
-        home_logo = lookup_logo(home)
-        away_logo = lookup_logo(away)
+    st.markdown("---")
 
-        col1, col2, col3 = st.columns([1,4,2])
-        with col1:
-            # away left, home right style with '@'
-            try:
-                if os.path.exists(away_logo):
-                    st.image(away_logo, width=64)
-                else:
+# ------------------
+# Main view
+# ------------------
+st.title("🏈 DJBets — NFL Predictor")
+st.caption(f"Season: {THIS_YEAR} — Week {week}")
+
+# If schedule empty -> show help
+if sched.empty:
+    st.warning("No schedule loaded. Please add data/schedule.csv or check ESPN connectivity.")
+    st.stop()
+
+# filter for week
+week_df = sched[sched["week"].astype(int) == int(week)].copy()
+if week_df.empty:
+    st.info("No games found for this week.")
+    st.stop()
+
+# fetch covers odds for week (best-effort)
+covers_df = fetch_covers_for_week(THIS_YEAR, week)
+if not covers_df.empty:
+    # canonical names already in covers parser
+    # create quick lookup by home-away canonical pair
+    covers_map = {}
+    for _, r in covers_df.iterrows():
+        key = (r["home"], r["away"])
+        covers_map[key] = {"spread": r.get("spread"), "over_under": r.get("over_under")}
+else:
+    covers_map = {}
+
+# prepare display columns
+cols = st.columns(1)
+for idx, r in week_df.reset_index(drop=True).iterrows():
+    home = r.get("home_team")
+    away = r.get("away_team")
+    status = r.get("status", "SCHEDULED")
+    home_score = r.get("home_score")
+    away_score = r.get("away_score")
+
+    # logos
+    home_logo = get_logo_path(home)
+    away_logo = get_logo_path(away)
+
+    # covers lookup
+    cov = covers_map.get((home, away)) or covers_map.get((away, home)) or {}
+    spread = cov.get("spread")
+    ou = cov.get("over_under")
+
+    # assemble card
+    with st.expander(f"{away} @ {home} — {status}", expanded=True):
+        rowc = st.columns([1,6,1])
+        # away block (left)
+        with rowc[0]:
+            if away_logo:
+                try:
+                    st.image(away_logo, width=60)
+                except Exception:
                     st.write(away)
-            except Exception:
-                st.write(away)
-        with col2:
-            st.markdown(f"### {away}  @  {home}")
-            # kickoff formatting
-            kickoff = row.get("start_time")
-            if pd.notna(kickoff):
-                try:
-                    kd = pd.to_datetime(kickoff)
-                    st.write(f"Kickoff: {kd.strftime('%a %b %d %Y %H:%M %Z') if hasattr(kd,'tzinfo') else kd.strftime('%a %b %d %Y %H:%M')}")
-                except Exception:
-                    st.write(f"Kickoff: {kickoff}")
-            # model probability
-            p = row.get("home_win_prob_model", 0.5)
-            if pd.isna(p):
-                p = 0.5
-            st.progress(float(p), text=f"Home Win Probability: {float(p)*100:.1f}%")
-            # show predicted winner
-            st.write(f"**Predicted winner:** {row.get('predicted_winner','TBD')}")
-        with col3:
-            # odds
-            sp = row.get("spread", np.nan)
-            ou = row.get("over_under", np.nan)
-            st.write(f"Spread (vegas): {sp if not pd.isna(sp) else 'N/A'}")
-            st.write(f"O/U: {ou if not pd.isna(ou) else 'N/A'}")
-            # recommendation simple edge calc: model_prob - market_prob (market prob from spread)
-            rec = "🚫 No Bet"
-            if not pd.isna(sp):
-                try:
-                    # convert spread to market probability (approx)
-                    # simple logistic approximation: p = 1 / (1 + 10^(spread/12))
-                    market_prob_home = 1.0 / (1.0 + 10 ** (float(sp)/12.0))
-                    blended = (1-market_weight)*float(p) + market_weight*market_prob_home
-                    edge_pp = (blended - market_prob_home) * 100
-                    if abs(edge_pp) >= bet_threshold:
-                        rec = "🛫 Bet Home" if blended>market_prob_home else "🛫 Bet Away"
-                    st.write(f"Edge: {edge_pp:+.1f} pp  | Market Prob: {market_prob_home*100:.1f}% | Blended: {blended*100:.1f}%")
-                except Exception:
-                    st.write("Edge: N/A")
             else:
+                st.write(away)
+        # center block: teams + model outputs
+        with rowc[1]:
+            st.markdown(f"**{away}**  @  **{home}**")
+            # show scores if present
+            if pd.notna(home_score) and pd.notna(away_score):
+                st.write(f"Final: {away} {away_score} — {home} {home_score}")
+            else:
+                st.write("Kickoff: TBD / upcoming")
+
+            # simple model features (we will simulate a fallback model probability)
+            # In production, replace with model.predict_proba over feature vector.
+            # For now: simple baseline from ELO difference if we can compute elos from history
+            model_prob = 0.5
+            try:
+                # compute ELOs for teams based on history
+                if not hist.empty:
+                    # use small helper to compute elos df for historical games
+                    elos = compute_simple_elo(hist)
+                    # get latest elos for each team (approx)
+                    h_elo = elos[elos["home"]==home]["elo_home"].dropna().iloc[-1] if any(elos["home"]==home) else 1500
+                    a_elo = elos[elos["away"]==away]["elo_away"].dropna().iloc[-1] if any(elos["away"]==away) else 1500
+                    elo_diff = h_elo - a_elo
+                    # convert to prob
+                    model_prob = 1.0 / (1 + 10 ** ((-elo_diff)/400.0))
+                else:
+                    model_prob = 0.5
+            except Exception:
+                model_prob = 0.5
+
+            st.progress(min(max(model_prob, 0.0), 1.0), text=f"Model home win probability: {model_prob*100:.1f}%")
+
+            # market probabilities via cover spread (convert spread to market prob crude)
+            market_prob = None
+            if spread is not None:
+                # If spread is positive -> home favored by spread (positive means ???)
+                # We'll assume spread is home - away (common). Convert to prob roughly:
+                market_prob = 1.0 / (1 + 10 ** ((-spread)/12))  # heuristic
+            blended_prob = None
+            if market_prob is not None:
+                blended_prob = market_weight * market_prob + (1 - market_weight) * model_prob
+
+            # display market/spread/edge
+            st.write(f"Spread (vegas): {spread if spread is not None else 'N/A'}")
+            st.write(f"O/U: {ou if ou is not None else 'N/A'}")
+            if market_prob is None:
+                st.write(f"Market Probability: N/A")
+            else:
+                st.write(f"Market Probability: {market_prob*100:.1f}%")
+            if blended_prob is None:
+                st.write(f"Blended Probability: N/A")
                 st.write("Edge: N/A")
-            st.write(rec)
-        st.markdown("---")
+                st.write("Recommendation: 🚫 No Bet")
+            else:
+                edge_pp = (blended_prob - market_prob) * 100
+                st.write(f"Blended Probability: {blended_prob*100:.1f}%")
+                st.write(f"Edge: {edge_pp:+.2f} pp")
+                # recommend if abs(edge_pp) >= threshold
+                if abs(edge_pp) >= bet_threshold_pp:
+                    rec = "Bet Home" if blended_prob > market_prob else "Bet Away"
+                    st.write(f"Recommendation: ✅ {rec} (edge {edge_pp:+.2f} pp)")
+                else:
+                    st.write("Recommendation: 🚫 No Bet (insufficient edge)")
 
-# Model bets & ROI
-try:
-    pnl, bets_made, roi = compute_roi(hist)
-    st.sidebar.markdown("### Performance")
-    st.sidebar.write(f"📈 PNL: {pnl:.2f}")
-    st.sidebar.write(f"🎯 Bets made: {bets_made}")
-    st.sidebar.write(f"💵 ROI per bet: {roi:.3f}")
-except Exception:
-    st.sidebar.write("Performance: N/A")
+        # right block
+        with rowc[2]:
+            if home_logo:
+                try:
+                    st.image(home_logo, width=60)
+                except Exception:
+                    st.write(home)
+            else:
+                st.write(home)
 
-st.caption(f"Updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
