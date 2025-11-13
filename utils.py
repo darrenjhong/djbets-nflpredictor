@@ -1,110 +1,147 @@
 # utils.py
-import requests, time, logging
+import requests
+import time
+import logging
+import os
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from team_logo_map import canonical_from_string, lookup_logo as lookup_logo_internal
+from datetime import datetime, timezone
 
-logger = logging.getLogger("djbets")
-logger.setLevel(logging.INFO)
-
-def safe_request_json(url, params=None, headers=None, timeout=10, max_retries=2, backoff=0.5):
-    """
-    Robust JSON fetch with retries. Returns dict or None on failure.
-    """
+# Simple HTTP JSON helper with backoff
+def safe_request_json(url, params=None, headers=None, timeout=8, retries=2, backoff=0.8):
     headers = headers or {"User-Agent": "DJBetsBot/1.0"}
-    for i in range(max_retries + 1):
+    for i in range(retries + 1):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            logger.debug(f"[safe_request_json] attempt {i} failed: {e}")
-            if i < max_retries:
-                time.sleep(backoff * (2 ** i))
-            else:
+            logging.debug("safe_request_json failed (%s) attempt=%d: %s", url, i, e)
+            if i == retries:
                 return None
+            time.sleep(backoff * (i + 1))
+    return None
 
-def normalize_team_name(s):
-    """
-    Return canonical team name (City + Mascot) or None.
-    Uses team_logo_map.canonical_from_string.
-    """
-    return canonical_from_string(s)
 
-def get_logo_path(team_name):
+# canonicalize team name -> filename-friendly
+def normalize_team_name(name: str) -> str:
+    if not name or pd.isna(name):
+        return ""
+    s = str(name).lower().strip()
+    # remove punctuation
+    for ch in [".", ",", "’", "'", ":", ";", "®", "™", "(", ")"]:
+        s = s.replace(ch, "")
+    s = s.replace(" ", "_")
+    s = s.replace("--", "-")
+    return s
+
+
+def get_logo_path(team_name: str, logos_dir="public/logos") -> str:
     """
-    team_name: canonical (City + Mascot) or any raw string.
-    Returns local path (string) or None.
+    Return local path for a team logo file. Does not raise.
+    If not exists, returns empty string.
     """
     if not team_name:
-        return None
-    # if not canonical, try to canonicalize
-    canonical = canonical_from_string(team_name) or team_name
-    return lookup_logo_internal(canonical)
+        return ""
+    fname = normalize_team_name(team_name)
+    # try png then jpg
+    for ext in ("png", "jpg", "jpeg", "webp"):
+        p = os.path.join(logos_dir, f"{fname}.{ext}")
+        if os.path.exists(p):
+            return p
+    # maybe user stored canonical names like 'CHI_bears.png' — try direct
+    for ext in ("png", "jpg", "jpeg", "webp"):
+        p = os.path.join(logos_dir, f"{team_name}.{ext}")
+        if os.path.exists(p):
+            return p
+    return ""
 
-# --- SIMPLE ELO helper (very lightweight) ---
-def compute_simple_elo(history_df, k=20, base=1500):
-    """
-    Accepts a historical dataframe with columns:
-       season, week, home_team, away_team, home_score, away_score
-    Returns dataframe with elo_home and elo_away columns (for each game)
-    Very small, incremental ELO calculation per season.
-    """
-    if history_df is None or history_df.empty:
-        return pd.DataFrame()
 
-    df = history_df.copy()
-    df = df.sort_values(["season", "week"]).reset_index(drop=True)
-    teams = {}
-    out_rows = []
+# Simple Elo aggregator — returns dict of team->current_elo
+def compute_simple_elo(historical_df, base_elo=1500, k=20):
+    """
+    historical_df expected to include columns: season, week, home_team, away_team,
+    home_score, away_score (scores may be numeric).
+    Returns dict mapping canonical team string -> elo value.
+    This is intentionally simple and robust to missing columns.
+    """
+    elos = {}
+    def ensure(t):
+        if pd.isna(t) or t == "":
+            return
+        if t not in elos:
+            elos[t] = base_elo
+
+    cols = set(historical_df.columns)
+    if not {"home_team", "away_team", "home_score", "away_score"}.issubset(cols):
+        return elos
+
+    df = historical_df.copy()
+    df = df.dropna(subset=["home_team", "away_team"])
+    # sort by season/week if available
+    if "season" in df.columns and "week" in df.columns:
+        try:
+            df = df.sort_values(["season", "week"])
+        except Exception:
+            pass
+
     for _, r in df.iterrows():
-        home = str(r.get("home_team", "")).strip()
-        away = str(r.get("away_team", "")).strip()
-        home_score = r.get("home_score")
-        away_score = r.get("away_score")
-        if pd.isna(home_score) or pd.isna(away_score):
-            # skip unlabeled game for ELO update, but still return current elos
-            h_elo = teams.get(home, base)
-            a_elo = teams.get(away, base)
-            out_rows.append({"home":home, "away":away, "elo_home":h_elo, "elo_away":a_elo})
+        h = r.get("home_team")
+        a = r.get("away_team")
+        hs = r.get("home_score")
+        as_ = r.get("away_score")
+        if pd.isna(h) or pd.isna(a):
             continue
-        h_elo = teams.get(home, base)
-        a_elo = teams.get(away, base)
-        # expected
-        exp_home = 1.0 / (1 + 10 ** ((a_elo - h_elo) / 400))
-        # result
-        if home_score > away_score:
-            s_home = 1.0
-        elif home_score < away_score:
-            s_home = 0.0
+        ensure(h); ensure(a)
+        try:
+            hs = float(hs)
+            as_ = float(as_)
+        except Exception:
+            continue
+        if hs == as_:
+            # treat as half-win
+            res_h = 0.5
+            res_a = 0.5
+        elif hs > as_:
+            res_h = 1.0
+            res_a = 0.0
         else:
-            s_home = 0.5
-        # update
-        h_new = h_elo + k * (s_home - exp_home)
-        a_new = a_elo + k * ((1 - s_home) - (1 - exp_home))
-        teams[home] = h_new
-        teams[away] = a_new
-        out_rows.append({"home":home, "away":away, "elo_home":h_elo, "elo_away":a_elo})
-    return pd.DataFrame(out_rows)
+            res_h = 0.0
+            res_a = 1.0
+        eh = elos.get(h, base_elo)
+        ea = elos.get(a, base_elo)
+        expected_h = 1.0 / (1.0 + 10 ** ((ea - eh) / 400.0))
+        expected_a = 1.0 - expected_h
+        elos[h] = eh + k * (res_h - expected_h)
+        elos[a] = ea + k * (res_a - expected_a)
+    return elos
 
-def compute_roi(history_df):
+
+def compute_roi(hist_df, edge_pp_threshold=3.0, stake=1.0):
     """
-    Very simple ROI calc: expects 'recommended' boolean and 'result' (1 correct, 0 wrong), 'bet_size' column.
-    Returns pnl, bets_made, roi_percent
+    hist_df expected to include predicted_label, actual result, and market implied probability (or spread)
+    This function is a simple placeholder producing (pnl, bets_count, roi_percent)
+    We'll be defensive: if required columns missing, return zeros.
     """
-    if history_df is None or history_df.empty:
+    # required columns are flexible — try to find recommended flag
+    if hist_df is None or hist_df.empty:
         return 0.0, 0, 0.0
-    df = history_df.copy()
-    if "recommended" not in df.columns or "result" not in df.columns:
+
+    s = hist_df.copy()
+    # if a 'recommended' boolean column exists, use it; otherwise attempt to infer from 'edge_pp'
+    if "recommended" in s.columns:
+        bets = s[s["recommended"] == True]
+    elif "edge_pp" in s.columns:
+        bets = s[s["edge_pp"].abs() >= edge_pp_threshold]
+    else:
+        # nothing to bet on
         return 0.0, 0, 0.0
-    bets = df[df["recommended"] == True]
-    if bets.empty:
-        return 0.0, 0, 0.0
-    bets["bet_size"] = bets.get("bet_size", 1.0)
-    bets["pnl"] = np.where(bets["result"]==1, bets["bet_size"]*1.0, -bets["bet_size"])
-    pnl = bets["pnl"].sum()
+
+    # must have 'profit' column or compute from actual result vs market — fallback to zeros
+    if "profit" in bets.columns:
+        pnl = bets["profit"].sum()
+    else:
+        pnl = 0.0
     bets_made = len(bets)
-    total_staked = (bets["bet_size"]).sum()
-    roi = (pnl / total_staked) * 100 if total_staked>0 else 0.0
-    return float(pnl), int(bets_made), float(roi)
+    roi = (pnl / (bets_made * stake)) * 100 if bets_made > 0 else 0.0
+    return pnl, bets_made, roi
