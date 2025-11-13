@@ -1,73 +1,117 @@
 # utils.py
-# Shared safe utilities for HTTP requests, cleaning, numerical conversions
+# Shared helpers for DJBets NFL Predictor (safe HTTP, Elo, ROI, misc utils)
 
 import requests
-import json
+import pandas as pd
+import numpy as np
 import time
 import traceback
-import streamlit as st
 
-
-# -------------------------------------------------------------------
-# Safe JSON request (returns None instead of crashing)
-# -------------------------------------------------------------------
-def safe_request_json(url, params=None, headers=None, retries=2, timeout=6):
-    """
-    Makes a safe HTTP GET request and returns parsed JSON or None on failure.
-    """
-    for attempt in range(retries + 1):
+# -----------------------------
+# Safe HTTP request wrapper
+# -----------------------------
+def safe_request_json(url, params=None, retries=3, timeout=10):
+    for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 return r.json()
-            else:
-                st.write(f"⚠️ Request error {r.status_code}: {url}")
-        except Exception as e:
-            st.write(f"⚠️ Exception during request: {e}")
-            traceback.print_exc()
-        time.sleep(0.3)
-
+            time.sleep(1)
+        except Exception:
+            time.sleep(1)
     return None
 
 
-# -------------------------------------------------------------------
-# Convert American odds to implied probability
-# -------------------------------------------------------------------
-def american_to_prob(odds):
+# -----------------------------
+# Simple Elo Calculation
+# -----------------------------
+def compute_simple_elo(df):
     """
-    Convert American odds (+110, -145, etc.) to implied probability.
-    Returns None if conversion fails.
+    Computes simple ELO values based on game outcomes.
+    df must contain:
+    - home_team, away_team
+    - home_score, away_score
     """
-    try:
-        odds = float(odds)
-        if odds > 0:
-            return 100 / (odds + 100)
+
+    if "home_score" not in df.columns or "away_score" not in df.columns:
+        # Fallback for incomplete historical archives (your case)
+        df["home_elo"] = 1500
+        df["away_elo"] = 1500
+        return df
+
+    elo = {}
+
+    def get_elo(team):
+        return elo.get(team, 1500)
+
+    def update_elo(team, new_rating):
+        elo[team] = new_rating
+
+    K = 20
+
+    home_elo_list = []
+    away_elo_list = []
+
+    for _, row in df.iterrows():
+        h = row["home_team"]
+        a = row["away_team"]
+
+        h_elo = get_elo(h)
+        a_elo = get_elo(a)
+
+        home_elo_list.append(h_elo)
+        away_elo_list.append(a_elo)
+
+        # Score
+        if row["home_score"] > row["away_score"]:
+            s_home, s_away = 1, 0
+        elif row["home_score"] < row["away_score"]:
+            s_home, s_away = 0, 1
         else:
-            return abs(odds) / (abs(odds) + 100)
-    except:
-        return None
+            s_home, s_away = 0.5, 0.5
+
+        # Expected probabilities
+        expected_home = 1 / (1 + 10 ** ((a_elo - h_elo) / 400))
+        expected_away = 1 - expected_home
+
+        # Updates
+        new_h = h_elo + K * (s_home - expected_home)
+        new_a = a_elo + K * (s_away - expected_away)
+
+        update_elo(h, new_h)
+        update_elo(a, new_a)
+
+    df["home_elo"] = home_elo_list
+    df["away_elo"] = away_elo_list
+
+    return df
 
 
-# -------------------------------------------------------------------
-# Compute expected margin or rating difference
-# -------------------------------------------------------------------
-def compute_edge(model_prob, market_prob):
+# -----------------------------
+# ROI + Model Record
+# -----------------------------
+def compute_roi(df):
     """
-    Returns edge in percentage points.
-    If either input missing, returns None.
+    Computes:
+    - ROI
+    - PnL
+    - model record: wins/losses
+    Expects df to contain:
+    - recommended (bool)
+    - actual_result (1 if correct, 0 if wrong)
     """
-    try:
-        if model_prob is None or market_prob is None:
-            return None
-        return (model_prob - market_prob) * 100
-    except:
-        return None
+    if "recommended" not in df.columns:
+        return 0, 0, 0
 
+    bets = df[df["recommended"] == True]
 
-# -------------------------------------------------------------------
-# Normalize team names across ESPN / Covers / internal archive
-# -------------------------------------------------------------------
-def normalize_team(name: str):
-    if not isinstance(name, str):
-        return None
-    return name.lower().replace(".", "").replace("'", "").strip()
+    if bets.empty:
+        return 0, 0, 0
+
+    wins = (bets["actual_result"] == 1).sum()
+    losses = (bets["actual_result"] == 0).sum()
+
+    pnl = wins * 1 - losses * 1  # flat unit betting
+    roi = pnl / max(len(bets), 1)
+
+    return pnl, len(bets), roi
