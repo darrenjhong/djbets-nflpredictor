@@ -138,14 +138,11 @@ model, model_status = train_model_from_history(hist_df)
 
 # ---------- Sidebar ----------
 # -----------------------------
-# DJBETS SIDEBAR — FINAL LOCKED VERSION YOU REQUESTED
+# DJBETS SIDEBAR — MINIMAL + ICON HEADERS ONLY
 # -----------------------------
 with st.sidebar:
 
-    # Title with bullseye icon
-    st.markdown("## 🎯 DJBets NFL Predictor")
-
-    # --- WEEK SELECTOR (dropdown) ---
+    # --- WEEK SELECTOR ---
     st.markdown("### 📅 Select Week")
 
     current_week = st.selectbox(
@@ -222,7 +219,7 @@ def prepare_week_schedule(season: int, week_num: int) -> pd.DataFrame:
                 df[c] = np.nan
     return df
 
-week_sched = prepare_week_schedule(CURRENT_SEASON, int(week))
+week_sched = prepare_week_schedule(CURRENT_SEASON, int(current_week))
 
 # Fetch covers odds (best-effort); will be empty DataFrame if fails
 st.markdown(f"## Week {current_week}")
