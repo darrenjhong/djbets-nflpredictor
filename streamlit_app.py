@@ -10,6 +10,7 @@ import traceback
 from data_loader import load_or_fetch_schedule, load_historical
 from covers_odds import fetch_covers_for_week
 from team_logo_map import canonical_team_name
+from team_logo_map import canonical_from_string
 from utils import get_logo_path, compute_simple_elo, compute_roi
 from model import train_model, predict
 # ML model
@@ -137,58 +138,86 @@ def train_model_from_history(history: pd.DataFrame):
 model, model_status = train_model_from_history(hist_df)
 
 # ---------- Sidebar ----------
-# -----------------------------
-# DJBETS SIDEBAR — MINIMAL + ICON HEADERS ONLY
-# -----------------------------
+# ======================================
+#          SIDEBAR (RESTORED STYLE)
+# ======================================
 with st.sidebar:
 
-    # --- WEEK SELECTOR ---
-    st.markdown("### 📅 Select Week")
-
-    current_week = st.selectbox(
-        "Week",
-        list(range(1, 19)),
-        index=(current_week - 1) if "current_week" in globals() else 0
+    # --- HEADER ---
+    st.markdown(
+        """
+        <h2 style='text-align:center; margin-bottom:5px;'>🏈 DJBets NFL</h2>
+        <p style='text-align:center; font-size:13px; color:#bbb;'>Predictions • Edges • Odds</p>
+        """,
+        unsafe_allow_html=True
     )
 
     st.markdown("---")
 
-    # --- MODEL CONTROLS ---
-    st.markdown("### ⚙️ Model Controls")
+    # --- WEEK SELECTOR DROPDOWN (RESTORED) ---
+    available_weeks = sorted(schedule_df["week"].dropna().unique().tolist())
+    if not available_weeks:
+        available_weeks = list(range(1, 19))
+
+    week = st.selectbox(
+        "📅 Select Week",
+        available_weeks,
+        index=available_weeks.index(max(available_weeks)) if available_weeks else 0,
+    )
+
+    st.markdown("---")
+
+    # --- MODEL CONTROLS (with icons restored) ---
+    st.markdown("### 🎯 Model Controls")
 
     market_weight = st.slider(
         "Market weight (blend model <> market)",
-        0.0, 1.0,
-        value=market_weight if "market_weight" in globals() else 0.5,
-        step=0.05
+        0.0, 1.0, 0.5, 0.01,
+        help="0 = pure model, 1 = pure market vegas lines"
     )
 
     bet_threshold = st.slider(
         "Bet threshold (edge pts)",
-        0.0, 15.0,
-        value=bet_threshold if "bet_threshold" in globals() else 4.0,
-        step=0.5,
+        0.0, 15.0, 2.5, 0.1,
+        help="Minimum projected edge required to recommend a bet"
     )
 
     st.markdown("---")
 
-    # --- MODEL RECORD ---
+    # --- MODEL RECORD CARD ---
     st.markdown("### 📊 Model Record")
 
-    if "model_record" in globals() and model_record:
-        roi     = model_record.get("roi", 0.0)
-        wins    = model_record.get("wins", 0)
-        losses  = model_record.get("losses", 0)
-        pushes  = model_record.get("pushes", 0)
-
+    if model_training_info.get("error"):
         st.markdown(
             f"""
-            **ROI:** {'🟢' if roi >= 0 else '🔴'} {roi:.1f}%  
-            **Record:** {wins}-{losses}-{pushes}
-            """
+            <div style='background:#330000; padding:10px; border-radius:8px; color:#ff7777;'>
+                {model_training_info["error"]}
+            </div>
+            """,
+            unsafe_allow_html=True
         )
     else:
-        st.info("No trained model available — Elo fallback active.")
+        if model_training_info.get("mode") == "elo":
+            st.markdown(
+                """
+                <div style='background:#222; padding:10px; border-radius:8px;'>
+                    Elo fallback model active — limited historical data.
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f"""
+                <div style='background:#111; padding:10px; border-radius:8px;'>
+                    ROI: <b>{model_training_info['roi']}%</b>  
+                    Record: <b>{model_training_info['wins']}-{model_training_info['losses']}</b>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+    st.markdown("---")
 
 # ---------- Prepare schedule for the chosen week ----------
 def prepare_week_schedule(season: int, week_num: int) -> pd.DataFrame:
