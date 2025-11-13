@@ -138,7 +138,6 @@ model, model_status = train_model_from_history(hist_df)
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.image("public/logos/logo.png", width=120)
     st.markdown("## DJBets NFL Predictor")
 
     current_week = st.number_input("Week", 1, 18, 1)
