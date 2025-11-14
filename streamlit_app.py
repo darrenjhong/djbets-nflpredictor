@@ -1,192 +1,326 @@
-﻿import streamlit as st
+﻿# ------------------------------------------------------------
+# DJBets NFL Predictor — Streamlit App
+# Covers + fastR + ESPN schedule, model predictions, logos
+# ------------------------------------------------------------
+
+import streamlit as st
 st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
 
 import pandas as pd
 import numpy as np
 import requests
+from io import StringIO
 import os
 
-# Local imports
-from schedule_loader import load_fastr_schedule
-from team_logo_map import canonical_team_name
-from utils import safe_request_json, get_logo_path
-
-
+# --------------------------
+# CONFIG
+# --------------------------
 CURRENT_SEASON = 2025
+LOGO_PATH = "public/logos"
 
+# ============================================================
+# LOAD FASTR SCHEDULE (Primary Source)
+# ============================================================
 
-# -------------------------------------------------
-# Covers: primary schedule + odds source
-# -------------------------------------------------
-def fetch_covers_matchups(season, week):
-    """
-    Scrapes Covers NFL matchups (very reliable).
-    Returns DataFrame with home/away & spreads.
-    """
+FASTR_URL = "https://raw.githubusercontent.com/nflverse/nflverse-data/master/releases/games.csv"
+
+@st.cache_data(show_spinner=False)
+def load_fastr_schedule(season: int):
     try:
-        url = f"https://www.covers.com/sports/nfl/matchups?selectedDate={season}-W{week:02d}"
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(FASTR_URL, timeout=10)
         r.raise_for_status()
-        html = r.text.lower()
+        df = pd.read_csv(StringIO(r.text))
 
-        games = []
-        blocks = html.split("cmg_matchup_game_box")[1:]
+        df.columns = [c.lower().strip() for c in df.columns]
 
-        for block in blocks:
-            try:
-                # Extract teams
-                home = block.split("home-team-name")[1].split(">")[1].split("<")[0]
-                away = block.split("away-team-name")[1].split(">")[1].split("<")[0]
+        df = df[df["season"] == season]
+        df = df[df["week"].between(1, 18)]
+        df = df[df["game_type"] == "REG"]
 
-                # Attempt spread extraction
-                if "spread-display" in block:
-                    spread = block.split("spread-display")[1].split(">")[1].split("<")[0]
-                else:
-                    spread = np.nan
+        df = df.rename(columns={
+            "home_team": "home_team",
+            "away_team": "away_team",
+            "home_score": "home_score",
+            "away_score": "away_score",
+        })
 
-                games.append({
-                    "season": season,
-                    "week": week,
-                    "home_team": canonical_team_name(home),
-                    "away_team": canonical_team_name(away),
-                    "spread": spread,
-                    "over_under": np.nan,
-                    "source": "covers"
-                })
-
-            except Exception:
-                continue
-
-        return pd.DataFrame(games)
+        keep = [
+            "season", "week", "home_team", "away_team",
+            "home_score", "away_score", "gameday", "game_id"
+        ]
+        df = df[[c for c in keep if c in df.columns]]
+        return df.reset_index(drop=True)
 
     except Exception as e:
-        print("[fetch_covers_matchups] ERROR:", e)
+        print("[FASTR ERROR]", e)
         return pd.DataFrame()
 
+# ============================================================
+# COVERS — SCRAPE ODDS & SPREADS
+# ============================================================
 
-# -------------------------------------------------
-# ESPN fallback
-# -------------------------------------------------
-def fetch_espn_scoreboard(season, week):
+@st.cache_data(show_spinner=False)
+def covers_fetch_week(season: int, week: int):
+    """
+    Returns DataFrame:
+    away_team, home_team, spread, over_under
+    """
     try:
-        url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week={week}&year={season}"
-        data = safe_request_json(url)
-        if not data:
+        url = f"https://www.covers.com/sports/nfl/matchups?season={season}&week={week}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+
+        dfs = pd.read_html(r.text)
+        if not dfs:
             return pd.DataFrame()
 
-        games = []
-        for event in data.get("events", []):
-            comp = event.get("competitions", [{}])[0]
+        df = dfs[0]
+        df.columns = [c.lower() for c in df.columns]
 
+        # Expecting columns: matchup, spread, total
+        if "matchup" not in df.columns:
+            return pd.DataFrame()
+
+        out = {"away_team": [], "home_team": [], "spread": [], "over_under": []}
+
+        for _, row in df.iterrows():
+            m = str(row["matchup"]).lower()
+            if " at " not in m:
+                continue
+            away, home = m.split(" at ")
+            out["away_team"].append(away.strip())
+            out["home_team"].append(home.strip())
+            out["spread"].append(row.get("spread", np.nan))
+            out["over_under"].append(row.get("total", np.nan))
+
+        return pd.DataFrame(out)
+
+    except Exception as e:
+        print("[COVERS ERROR]", e)
+        return pd.DataFrame()
+
+
+# ============================================================
+# ESPN — fallback scoreboard
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def espn_fetch_week(season: int, week: int):
+    try:
+        url = f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={week}&dates={season}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+
+        rows = []
+        for ev in data.get("events", []):
+            comp = ev.get("competitions", [{}])[0]
             teams = comp.get("competitors", [])
-            if len(teams) != 2:
-                continue
 
-            home = [t for t in teams if t.get("homeAway") == "home"]
-            away = [t for t in teams if t.get("homeAway") == "away"]
-            if not home or not away:
-                continue
+            away = next((t for t in teams if t.get("homeAway") == "away"), {})
+            home = next((t for t in teams if t.get("homeAway") == "home"), {})
 
-            home = home[0]
-            away = away[0]
-
-            games.append({
+            rows.append({
                 "season": season,
                 "week": week,
-                "home_team": canonical_team_name(home["team"]["shortDisplayName"]),
-                "away_team": canonical_team_name(away["team"]["shortDisplayName"]),
-                "home_score": home.get("score"),
-                "away_score": away.get("score"),
-                "status": comp.get("status", {}).get("type", {}).get("name", "unknown"),
-                "source": "espn"
+                "away_team": away.get("team", {}).get("displayName", "").lower(),
+                "home_team": home.get("team", {}).get("displayName", "").lower(),
+                "away_score": int(away.get("score", 0)) if away.get("score") else np.nan,
+                "home_score": int(home.get("score", 0)) if home.get("score") else np.nan,
+                "status": ev.get("status", {}).get("type", {}).get("description", "scheduled").lower()
             })
+        return pd.DataFrame(rows)
 
-        return pd.DataFrame(games)
-    except Exception:
+    except Exception as e:
+        print("[ESPN ERROR]", e)
         return pd.DataFrame()
 
 
-# -------------------------------------------------
-# Build week schedule (Covers → ESPN → fastR)
-# -------------------------------------------------
-def build_week_schedule(season, week):
-    # 1) Try Covers
-    covers = fetch_covers_matchups(season, week)
-    if not covers.empty:
-        return covers
+# ============================================================
+# LOGOS
+# ============================================================
 
-    # 2) ESPN fallback
-    espn = fetch_espn_scoreboard(season, week)
-    if not espn.empty:
-        return espn
+def logo_path(team: str):
+    """Return full path for a team logo."""
+    if not team:
+        return ""
+    fname = f"{team.lower().replace(' ', '_')}.png"
+    p = os.path.join(LOGO_PATH, fname)
+    return p if os.path.exists(p) else ""
 
-    # 3) fastR backup
+
+# ============================================================
+# BUILD WEEK SCHEDULE
+# ============================================================
+
+def build_week_schedule(season: int, week: int):
+    """Merge fastR + Covers + ESPN"""
+    # fastR schedule first
     fastr = load_fastr_schedule(season)
+    block = fastr[fastr["week"] == week].copy()
 
-    # Safety: if fastR did not load
-    if fastr.empty or "week" not in fastr.columns:
-        return pd.DataFrame()
+    # Add empty betting fields
+    block["spread"] = np.nan
+    block["over_under"] = np.nan
+    block["status"] = "scheduled"
 
-    fastr_week = fastr[fastr["week"] == week]
-    return fastr_week.reset_index(drop=True)
+    # Covers odds
+    covers = covers_fetch_week(season, week)
+    if not covers.empty:
+        for i, r in block.iterrows():
+            hit = covers[
+                (covers["home_team"] == r["home_team"]) &
+                (covers["away_team"] == r["away_team"])
+            ]
+            if not hit.empty:
+                block.loc[i, "spread"] = hit.iloc[0]["spread"]
+                block.loc[i, "over_under"] = hit.iloc[0]["over_under"]
+
+    # ESPN fallback for score/status
+    espn = espn_fetch_week(season, week)
+    if not espn.empty:
+        for i, r in block.iterrows():
+            hit = espn[
+                (espn["home_team"] == r["home_team"]) &
+                (espn["away_team"] == r["away_team"])
+            ]
+            if not hit.empty:
+                row = hit.iloc[0]
+                block.loc[i, "home_score"] = row["home_score"]
+                block.loc[i, "away_score"] = row["away_score"]
+                block.loc[i, "status"] = row["status"]
+
+    return block.reset_index(drop=True)
 
 
-# -------------------------------------------------
-# Sidebar UI (Style A)
-# -------------------------------------------------
+# ============================================================
+# MODEL (placeholder prediction)
+# ============================================================
+
+def model_predict(row):
+    """Dummy model logic so UI works"""
+    # Simple Elo-like random placeholder
+    h = np.random.normal(0, 3)
+    a = np.random.normal(0, 3)
+    diff = h - a
+    pred = row["home_team"] if diff > 0 else row["away_team"]
+    return pred, diff
+
+
+# ============================================================
+# GAME ROW DISPLAY
+# ============================================================
+
+def render_game_row(row):
+    home = row["home_team"]
+    away = row["away_team"]
+
+    home_logo = logo_path(home)
+    away_logo = logo_path(away)
+
+    pred, edge = model_predict(row)
+
+    status = row.get("status", "")
+    home_score = row.get("home_score", None)
+    away_score = row.get("away_score", None)
+
+    logo_style = "height:55px; margin-bottom:4px;"
+
+    # MAIN MATCHUP ROW
+    st.markdown(
+        f"""
+        <div style="
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            padding:18px 0;
+            border-bottom:1px solid #e5e5e5;
+        ">
+
+            <div style="width:30%; text-align:center;">
+                <img src="{away_logo}" style="{logo_style}">
+                <div style="margin-top:6px; font-size:17px;">{away.title()}</div>
+            </div>
+
+            <div style="width:10%; text-align:center; font-size:28px; font-weight:600;">
+                @
+            </div>
+
+            <div style="width:30%; text-align:center;">
+                <img src="{home_logo}" style="{logo_style}">
+                <div style="margin-top:6px; font-size:17px;">{home.title()}</div>
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Prediction + Spread + Score
+    score_text = ""
+    if status in ("final", "complete", "post"):
+        score_text = f"**Final Score:** {away_score} – {home_score}"
+
+    st.markdown(
+        f"""
+        <div style="padding: 10px 4px 20px;">
+            <b>Spread:</b> {row['spread'] if row['spread']==row['spread'] else '—'}
+            &nbsp; | &nbsp;
+            <b>Total:</b> {row['over_under'] if row['over_under']==row['over_under'] else '—'}
+            <br><br>
+
+            <b>Model Pick:</b>
+            <span style="color:#00b300; font-size:18px;">
+                {pred.title()} by {abs(edge):.1f} pts
+            </span>
+            <br>
+            {score_text}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# ============================================================
+# UI START
+# ============================================================
+
 with st.sidebar:
     st.markdown("""
     <div style='text-align:center; margin-bottom:15px;'>
-        <img src='https://img.icons8.com/ios-filled/100/target.png' width='55'>
+        <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("## 🏈 DJBets NFL Predictor")
 
-    # Week selector: always allow 1–18 even if schedule empty
-    week_list = list(range(1, 19))
-    current_week = st.selectbox("📅 Select Week", week_list, index=0)
+    # Load fastR for week selector
+    fast_df = load_fastr_schedule(CURRENT_SEASON)
+    weeks = sorted(fast_df["week"].unique().tolist()) if not fast_df.empty else list(range(1,19))
+
+    current_week = st.selectbox("Select Week", weeks, index=0)
 
     st.markdown("### ⚙️ Model Controls")
-    market_weight = st.slider("Market weight (blend model <> market)", 0.0, 1.0, 0.00, 0.01)
+    market_weight = st.slider("Market weight (blend model <> market)", 0.0, 1.0, 0.0, 0.01)
     bet_threshold = st.slider("Bet threshold (edge pts)", 0.0, 20.0, 5.0, 0.5)
 
     st.markdown("### 📊 Model Record")
     st.info("Model trained using local data + Elo fallback.")
 
 
-# -------------------------------------------------
-# Main UI
-# -------------------------------------------------
-st.subheader(f"DJBets — Season {CURRENT_SEASON} — Week {current_week}")
+# MAIN TITLE
+st.title(f"DJBets — Season {CURRENT_SEASON} — Week {current_week}")
 
-with st.spinner("Loading NFL schedule..."):
-    sched = build_week_schedule(CURRENT_SEASON, current_week)
+# FETCH WEEK SCHEDULE
+with st.spinner(f"Loading schedule for week {current_week}..."):
+    sched = build_week_schedule(CURRENT_SEASON, int(current_week))
 
 if sched.empty:
-    st.error("No schedule found from Covers, fastR, or ESPN. This may be temporary. Try again later.")
+    st.error("No schedule found from Covers, fastR, or ESPN. This may be temporary (Cloudflare). Try again later.")
     st.stop()
 
 st.success(f"Loaded {len(sched)} games for Week {current_week}")
 
-# -------------------------------------------------
-# Display schedule + predictions placeholder
-# -------------------------------------------------
-for idx, game in sched.iterrows():
-    home = game.get("home_team", "")
-    away = game.get("away_team", "")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-
-    with col1:
-        st.image(get_logo_path(home), width=60)
-        st.write(home.replace("_", " ").title())
-
-    with col2:
-        st.markdown("### VS")
-
-    with col3:
-        st.image(get_logo_path(away), width=60)
-        st.write(away.replace("_", " ").title())
-
-    st.divider()
+# Render each game row
+for _, row in sched.iterrows():
+    render_game_row(row)
