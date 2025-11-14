@@ -149,40 +149,71 @@ def logo_path(team: str):
     return p if os.path.exists(p) else ""
 
 
-st.write("fastr columns:", list(fastr.columns))
-st.write("fastr sample:", fastr.head())
-
-
 # ============================================================
 # BUILD WEEK SCHEDULE
 # ============================================================
 
 def build_week_schedule(season: int, week: int):
-    """Merge fastR + Covers + ESPN"""
-    # fastR schedule first
-    fastr = load_fastr_schedule(season)
-    block = fastr[fastr["week"] == week].copy()
+    """Merge fastR + Covers + ESPN with fallback if fastR is unavailable."""
 
-    # Add empty betting fields
+    # Try fastR schedule first
+    fastr = load_fastr_schedule(season)
+
+    if not fastr.empty and "week" in fastr.columns:
+        # Standard path: filter fastR by week
+        block = fastr[fastr["week"] == week].copy()
+    else:
+        # If fastR failed (404 or no week column), start with an empty block
+        block = pd.DataFrame()
+
+    # If we still have nothing for this week, fall back to ESPN as the base schedule
+    if block.empty:
+        block = espn_fetch_week(season, week)
+        if block.empty:
+            # No data from fastR or ESPN — give up for this week
+            return pd.DataFrame()
+
+        # Normalize team names to lowercase to match Covers parsing
+        for col in ["home_team", "away_team"]:
+            if col in block.columns:
+                block[col] = block[col].str.lower()
+
+    # Ensure required columns exist
+    if "home_score" not in block.columns:
+        block["home_score"] = np.nan
+    if "away_score" not in block.columns:
+        block["away_score"] = np.nan
+    if "status" not in block.columns:
+        block["status"] = "scheduled"
+
+    # Add betting fields
     block["spread"] = np.nan
     block["over_under"] = np.nan
-    block["status"] = "scheduled"
 
     # Covers odds
     covers = covers_fetch_week(season, week)
     if not covers.empty:
+        # Normalize Covers team names too
+        for col in ["home_team", "away_team"]:
+            if col in covers.columns:
+                covers[col] = covers[col].str.lower()
+
         for i, r in block.iterrows():
             hit = covers[
                 (covers["home_team"] == r["home_team"]) &
                 (covers["away_team"] == r["away_team"])
             ]
             if not hit.empty:
-                block.loc[i, "spread"] = hit.iloc[0]["spread"]
-                block.loc[i, "over_under"] = hit.iloc[0]["over_under"]
+                block.loc[i, "spread"] = hit.iloc[0].get("spread", np.nan)
+                block.loc[i, "over_under"] = hit.iloc[0].get("over_under", np.nan)
 
-    # ESPN fallback for score/status
+    # ESPN as score/status overlay (even if ESPN was the base, this is harmless)
     espn = espn_fetch_week(season, week)
     if not espn.empty:
+        for col in ["home_team", "away_team"]:
+            if col in espn.columns:
+                espn[col] = espn[col].str.lower()
+
         for i, r in block.iterrows():
             hit = espn[
                 (espn["home_team"] == r["home_team"]) &
@@ -190,11 +221,12 @@ def build_week_schedule(season: int, week: int):
             ]
             if not hit.empty:
                 row = hit.iloc[0]
-                block.loc[i, "home_score"] = row["home_score"]
-                block.loc[i, "away_score"] = row["away_score"]
-                block.loc[i, "status"] = row["status"]
+                block.loc[i, "home_score"] = row.get("home_score", np.nan)
+                block.loc[i, "away_score"] = row.get("away_score", np.nan)
+                block.loc[i, "status"] = row.get("status", "scheduled")
 
     return block.reset_index(drop=True)
+
 
 
 # ============================================================
