@@ -113,7 +113,7 @@ def load_week_data(season, week):
         return finalize_schedule(covers)
 
     # 2 — fastR full-season schedule fallback
-    fastR = load_fastr_schedule(season)
+    fastR = load_fastr_schedule(int(season))
     if not fastR.empty:
         wk = fastR[fastR["week"] == week]
         if not wk.empty:

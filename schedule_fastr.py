@@ -3,48 +3,42 @@ import pandas as pd
 import requests
 from io import StringIO
 
-FASTR_URL = "https://raw.githubusercontent.com/nflverse/nflfastR-roster/master/data/games.csv"
+FASTR_URL = "https://raw.githubusercontent.com/nflverse/nflverse-data/master/games/games.csv"
 
 def load_fastr_schedule(season: int):
     """
-    Loads complete NFL schedule for the given season using the NFLverse FastR dataset.
-    Works 100% reliably on Streamlit Cloud (no Cloudflare, no API key).
+    Loads complete NFL schedule for the given season using the NFLverse dataset.
+    This file ALWAYS contains full schedules (past + future) for all seasons.
     """
     try:
-        r = requests.get(FASTR_URL, timeout=10)
+        r = requests.get(FASTR_URL, timeout=15)
         r.raise_for_status()
 
         df = pd.read_csv(StringIO(r.text))
 
-        # normalize names
+        # Normalize
         df.columns = [c.lower().strip() for c in df.columns]
 
-        # rename a few columns to match internal usage
-        df = df.rename(columns={
-            "home_team": "home_team",
-            "away_team": "away_team",
-            "result": "result",
-        })
-
-        # filter by season + regular season weeks 1–18
+        # Keep only regular season
         df = df[(df["season"] == season) & (df["week"].between(1, 18))]
 
-        # select minimum required columns
-        keep = [
-            "season",
-            "week",
-            "home_team",
-            "away_team",
-            "home_score",
-            "away_score",
-            "game_id",
-            "game_type",
-            "gameday"
-        ]
-        df = df[[c for c in keep if c in df.columns]]
+        if df.empty:
+            return pd.DataFrame()
 
-        return df.reset_index(drop=True)
+        # Canonical fields our app expects
+        cleaned = pd.DataFrame({
+            "season": df["season"],
+            "week": df["week"],
+            "home_team": df["home_team"].astype(str),
+            "away_team": df["away_team"].astype(str),
+            "home_score": df.get("home_score", pd.NA),
+            "away_score": df.get("away_score", pd.NA),
+            "game_id": df.get("game_id", pd.NA),
+            "gameday": df.get("gameday", pd.NA),
+        })
+
+        return cleaned.reset_index(drop=True)
 
     except Exception as e:
-        print("[load_fastr_schedule] ERROR:", e)
+        print("FAST-R LOAD ERROR:", e)
         return pd.DataFrame()
