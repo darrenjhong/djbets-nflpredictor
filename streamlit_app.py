@@ -30,46 +30,153 @@ st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
 CURRENT_SEASON = datetime.now().year
 MAX_WEEKS = 18
 
-# -------------------------
-# Sidebar (minimal with icons)
-# -------------------------
-with st.sidebar:
-    st.markdown("🏈 **DJBets NFL Predictor**", unsafe_allow_html=True)
-    st.write("")
-    # Week picker at top (single selection)
-    schedule_df = load_or_fetch_schedule(CURRENT_SEASON)
-    if schedule_df is not None and not schedule_df.empty and "week" in schedule_df.columns:
-        available_weeks = sorted([int(x) for x in schedule_df["week"].dropna().unique().tolist()])
-        default_week = available_weeks[0] if available_weeks else 1
-    else:
-        available_weeks = list(range(1, MAX_WEEKS + 1))
-        default_week = 1
+# ----------------------------
+# Sidebar (restored: "Sidebar A")
+# ----------------------------
+import streamlit as st
 
-    week = st.selectbox("📅 Week", options=available_weeks, index=max(0, available_weeks.index(default_week)) if default_week in available_weeks else 0)
+def render_sidebar(
+    available_weeks,
+    current_week,
+    games_source_name="ESPN",
+    spreads_source_name="SportsOddsHistory",
+    model_info=None,
+    default_market_weight=0.5,
+    default_bet_threshold=3.0,
+    default_weather_sensitivity=1.0,
+):
+    """
+    Render Sidebar A and return a dict of user selections:
+      {
+        "week": int,
+        "market_weight": float,
+        "bet_threshold": float,
+        "weather_sensitivity": float,
+        "games_source": str,
+        "spreads_source": str,
+      }
 
-    st.markdown("---")
-    st.markdown("⚙️ **Model Controls**")
-    market_weight = st.slider("Market weight (blend model <> market)", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
-    bet_threshold = st.slider("Bet threshold (edge pts)", min_value=0.0, max_value=20.0, value=3.0, step=0.5)
+    - available_weeks: list-like of week labels (ints or "Week N" strings).
+    - current_week: int (preferred default).
+    - model_info: dict with keys: {"trained": bool, "teams": int, "roi": float, "record": (wins,losses)} or None.
+    """
+    # ensure model_info has defaults
+    if model_info is None:
+        model_info = {"trained": False, "teams": 0, "roi": None, "record": None, "note": "No trained model available — Elo fallback active."}
 
-    st.markdown("---")
-    st.markdown("📊 **Model Record**")
-    # placeholder trackers - filled later
-    model_record_col = st.empty()
+    # Sidebar container
+    with st.sidebar:
+        # Title (compact; no DJBets logo)
+        st.markdown("### 🏈 DJBets NFL Predictor")
+        st.markdown("")  # small spacing
 
-    st.markdown("---")
+        # --- Week selector at top ---
+        st.markdown("#### 📅 Week")
+        # normalize available_weeks to string labels for display
+        try:
+            # If weeks are numeric -> show "Week X"
+            if all(isinstance(w, (int, float)) for w in available_weeks):
+                week_labels = [f"Week {int(w)}" for w in available_weeks]
+                default_idx = 0
+                if current_week in available_weeks:
+                    default_idx = list(available_weeks).index(current_week)
+            else:
+                week_labels = [str(w) for w in available_weeks]
+                default_idx = 0
+                if str(current_week) in week_labels:
+                    default_idx = week_labels.index(str(current_week))
+        except Exception:
+            week_labels = ["1"]
+            default_idx = 0
 
-# -------------------------
-# Load historical & model
-# -------------------------
-hist = load_historical()  # local archive if present
-model_info = build_model_from_history(hist)  # returns trained object or fallback data structure
+        week_choice_label = st.selectbox(
+            label="",
+            options=week_labels,
+            index=default_idx,
+            help="Select which week to view",
+            key="sidebar_week_select",
+        )
+        # convert back to int if possible
+        try:
+            if week_choice_label.lower().startswith("week"):
+                selected_week = int(week_choice_label.split()[-1])
+            else:
+                selected_week = int(week_choice_label)
+        except Exception:
+            # fallback: if not parseable, keep original label
+            selected_week = week_choice_label
 
-# Show model status in sidebar
-if model_info.get("trained", False):
-    model_record_col.markdown(f"✅ Trained model available — {model_info.get('notes','')}")
-else:
-    model_record_col.markdown(f"⚠️ No trained model available — Elo fallback active.")
+        st.markdown("")  # small spacing
+
+        # --- Sources info (compact) ---
+        st.markdown("**Games Source:**  " + f"🟢 {games_source_name}")
+        st.markdown("**Spreads Source:**  " + f"🟢 {spreads_source_name}")
+        st.markdown("")  # space
+
+        # --- Model Controls ---
+        st.markdown("#### ⚙️ Model Controls")
+        market_weight = st.slider(
+            "Market weight (blend model <> market)",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(default_market_weight),
+            step=0.01,
+            key="market_weight",
+        )
+
+        bet_threshold = st.slider(
+            "Bet threshold (edge pts)",
+            min_value=0.0,
+            max_value=20.0,
+            value=float(default_bet_threshold),
+            step=0.5,
+            key="bet_threshold",
+        )
+
+        weather_sensitivity = st.slider(
+            "Weather sensitivity",
+            min_value=0.0,
+            max_value=3.0,
+            value=float(default_weather_sensitivity),
+            step=0.1,
+            key="weather_sensitivity",
+        )
+
+        st.markdown("")  # small spacing
+
+        # --- Model Record (compact card) ---
+        st.markdown("#### 📊 Model Record")
+        if model_info.get("trained", False):
+            teams = model_info.get("teams", 0)
+            roi = model_info.get("roi", None)
+            record = model_info.get("record", None)
+            # compact metrics
+            st.write(f"✅ Trained model available — teams: **{teams}**")
+            if roi is not None:
+                st.write(f"ROI: **{roi:+.2f}%**")
+            if record:
+                w, l = record
+                st.write(f"Record: **{w}-{l}**")
+            if model_info.get("note"):
+                st.caption(model_info["note"])
+        else:
+            note = model_info.get("note", "No trained model available — Elo fallback active.")
+            st.info(note)
+
+        # small separator / credits removed per request
+        st.markdown("---")
+        # keep some tiny footer to avoid a dead empty sidebar
+        st.caption(" ")
+
+    # return selections in a dict for the main app to use
+    return {
+        "week": selected_week,
+        "market_weight": market_weight,
+        "bet_threshold": bet_threshold,
+        "weather_sensitivity": weather_sensitivity,
+        "games_source": games_source_name,
+        "spreads_source": spreads_source_name,
+    }
 
 # -------------------------
 # Prepare week schedule (merge spreads from Covers/ESPN/local)
