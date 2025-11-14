@@ -1,15 +1,7 @@
 ﻿streamlit>=1.26
 pandas
 numpy
-<<<<<<< HEAD
 scikit-learn
 xgboost
 requests
 beautifulsoup4
-=======
-requests
-beautifulsoup4
-scikit-learn
-joblib
-xgboost    # optional, fallback to sklearn if not available
->>>>>>> 83e4cd8c405192af3350849f65cd9e3058c42b44
