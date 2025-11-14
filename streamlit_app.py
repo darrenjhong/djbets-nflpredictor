@@ -24,19 +24,30 @@ LOGO_PATH = "public/logos"
 
 FASTR_URL = "https://raw.githubusercontent.com/nflverse/nflverse-data/master/releases/games.csv"
 
+
 @st.cache_data(show_spinner=False)
 def load_fastr_schedule(season: int):
+    """
+    Try to download weekly game schedule from nflverse fastR CSV.
+    If the request fails (404, timeout, etc.), return empty DataFrame.
+    """
     try:
         r = requests.get(FASTR_URL, timeout=10)
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text))
 
+        # Normalize column names
         df.columns = [c.lower().strip() for c in df.columns]
 
-        df = df[df["season"] == season]
-        df = df[df["week"].between(1, 18)]
-        df = df[df["game_type"] == "REG"]
+        # Filter to this season and regular-season weeks
+        if "season" in df.columns:
+            df = df[df["season"] == season]
+        if "week" in df.columns:
+            df = df[df["week"].between(1, 18)]
+        if "game_type" in df.columns:
+            df = df[df["game_type"] == "REG"]
 
+        # Ensure expected columns exist or are renamed
         df = df.rename(columns={
             "home_team": "home_team",
             "away_team": "away_team",
@@ -64,6 +75,7 @@ def covers_fetch_week(season: int, week: int):
     """
     Returns DataFrame:
     away_team, home_team, spread, over_under
+    Scrapes Covers.com's NFL matchups page for that season/week.
     """
     try:
         url = f"https://www.covers.com/sports/nfl/matchups?season={season}&week={week}"
@@ -99,15 +111,21 @@ def covers_fetch_week(season: int, week: int):
         print("[COVERS ERROR]", e)
         return pd.DataFrame()
 
-
 # ============================================================
 # ESPN — fallback scoreboard
 # ============================================================
 
 @st.cache_data(show_spinner=False)
 def espn_fetch_week(season: int, week: int):
+    """
+    Fetch weekly schedule + scores from ESPN's public scoreboard API.
+    Uses explicit year + seasontype (2 = regular season) + week.
+    """
     try:
-        url = f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={week}&dates={season}"
+        url = (
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?year={season}&seasontype=2&week={week}"
+        )
         r = requests.get(url, timeout=8)
         r.raise_for_status()
         data = r.json()
@@ -127,14 +145,13 @@ def espn_fetch_week(season: int, week: int):
                 "home_team": home.get("team", {}).get("displayName", "").lower(),
                 "away_score": int(away.get("score", 0)) if away.get("score") else np.nan,
                 "home_score": int(home.get("score", 0)) if home.get("score") else np.nan,
-                "status": ev.get("status", {}).get("type", {}).get("description", "scheduled").lower()
+                "status": ev.get("status", {}).get("type", {}).get("description", "scheduled").lower(),
             })
         return pd.DataFrame(rows)
 
     except Exception as e:
         print("[ESPN ERROR]", e)
         return pd.DataFrame()
-
 
 # ============================================================
 # LOGOS
@@ -147,7 +164,6 @@ def logo_path(team: str):
     fname = f"{team.lower().replace(' ', '_')}.png"
     p = os.path.join(LOGO_PATH, fname)
     return p if os.path.exists(p) else ""
-
 
 # ============================================================
 # BUILD WEEK SCHEDULE
@@ -187,8 +203,10 @@ def build_week_schedule(season: int, week: int):
         block["status"] = "scheduled"
 
     # Add betting fields
-    block["spread"] = np.nan
-    block["over_under"] = np.nan
+    if "spread" not in block.columns:
+        block["spread"] = np.nan
+    if "over_under" not in block.columns:
+        block["over_under"] = np.nan
 
     # Covers odds
     covers = covers_fetch_week(season, week)
@@ -227,21 +245,18 @@ def build_week_schedule(season: int, week: int):
 
     return block.reset_index(drop=True)
 
-
-
 # ============================================================
 # MODEL (placeholder prediction)
 # ============================================================
 
 def model_predict(row):
-    """Dummy model logic so UI works"""
+    """Dummy model logic so UI works."""
     # Simple Elo-like random placeholder
     h = np.random.normal(0, 3)
     a = np.random.normal(0, 3)
     diff = h - a
     pred = row["home_team"] if diff > 0 else row["away_team"]
     return pred, diff
-
 
 # ============================================================
 # GAME ROW DISPLAY
@@ -289,7 +304,7 @@ def render_game_row(row):
 
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     # Prediction + Spread + Score
@@ -313,26 +328,28 @@ def render_game_row(row):
             {score_text}
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
-
 
 # ============================================================
 # UI START
 # ============================================================
 
 with st.sidebar:
-    st.markdown("""
-    <div style='text-align:center; margin-bottom:15px;'>
-        <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div style='text-align:center; margin-bottom:15px;'>
+            <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("## 🏈 DJBets NFL Predictor")
 
-    # Load fastR for week selector
+    # Load fastR for week selector (fallback to full 1-18 range)
     fast_df = load_fastr_schedule(CURRENT_SEASON)
-    weeks = sorted(fast_df["week"].unique().tolist()) if not fast_df.empty else list(range(1,19))
+    weeks = sorted(fast_df["week"].unique().tolist()) if not fast_df.empty and "week" in fast_df.columns else list(range(1, 19))
 
     current_week = st.selectbox("Select Week", weeks, index=0)
 
@@ -342,7 +359,6 @@ with st.sidebar:
 
     st.markdown("### 📊 Model Record")
     st.info("Model trained using local data + Elo fallback.")
-
 
 # MAIN TITLE
 st.title(f"DJBets — Season {CURRENT_SEASON} — Week {current_week}")
