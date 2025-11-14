@@ -149,6 +149,10 @@ def logo_path(team: str):
     return p if os.path.exists(p) else ""
 
 
+st.write("fastr columns:", list(fastr.columns))
+st.write("fastr sample:", fastr.head())
+
+
 # ============================================================
 # BUILD WEEK SCHEDULE
 # ============================================================
