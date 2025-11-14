@@ -1,117 +1,83 @@
 # model.py
-import os
-import pickle
+"""
+Lightweight model helpers:
+- build_model_from_history(hist_df): compute simple per-team Elo-like average and return structure
+- predict_game_row(row, model_info): returns home_prob, model_spread, pred_home_score, pred_away_score
+"""
+
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+import math
+from collections import defaultdict
 
-MODEL_PATH = "data/model.pkl"
+def build_model_from_history(hist_df: pd.DataFrame):
+    """
+    Compute per-team average points scored and allowed as a tiny 'model'.
+    If hist_df empty/insufficient, we return fallback structure (trained=False).
+    """
+    info = {"trained": False, "notes": "", "team_avg": {}, "season": None}
+    if hist_df is None or hist_df.empty or "home_team" not in hist_df.columns or "home_score" not in hist_df.columns:
+        info["notes"] = "insufficient_history"
+        return info
 
-# Features we expect for training/prediction
-DEFAULT_FEATURES = ["elo_diff", "spread", "over_under"]
+    # compute per-team averages
+    team_stats = {}
+    teams = set(hist_df["home_team"].dropna().unique()).union(set(hist_df["away_team"].dropna().unique()))
+    for t in teams:
+        # home offense
+        home_points = hist_df.loc[hist_df["home_team"]==t, "home_score"].dropna().astype(float)
+        away_points = hist_df.loc[hist_df["away_team"]==t, "away_score"].dropna().astype(float)
+        scored = pd.concat([home_points, away_points]) if not home_points.empty or not away_points.empty else pd.Series(dtype=float)
+        # points allowed
+        allowed_home = hist_df.loc[hist_df["home_team"]==t, "away_score"].dropna().astype(float)
+        allowed_away = hist_df.loc[hist_df["away_team"]==t, "home_score"].dropna().astype(float)
+        allowed = pd.concat([allowed_home, allowed_away]) if not allowed_home.empty or not allowed_away.empty else pd.Series(dtype=float)
+        avg_scored = float(scored.mean()) if not scored.empty else 21.0
+        avg_allowed = float(allowed.mean()) if not allowed.empty else 21.0
+        team_stats[t] = {"scored": avg_scored, "allowed": avg_allowed}
+    info["trained"] = True
+    info["team_avg"] = team_stats
+    info["notes"] = f"teams:{len(team_stats)}"
+    return info
 
-def prepare_training_df(hist_df: pd.DataFrame):
-    # Expect historical with home_team, away_team, home_score, away_score
-    if hist_df is None or hist_df.empty:
-        return pd.DataFrame(), []
-    df = hist_df.copy()
-    # crude feature engineering: compute elo diff if present else zero
-    if "elo_home" not in df.columns or "elo_away" not in df.columns:
-        df["elo_home"] = 1500
-        df["elo_away"] = 1500
-    df["elo_diff"] = df["elo_home"] - df["elo_away"]
-    # ensure spread/over_under exist
-    for c in ["spread", "over_under"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    # label: home win
-    df["home_win"] = (pd.to_numeric(df.get("home_score", 0), errors="coerce") > pd.to_numeric(df.get("away_score", 0), errors="coerce")).astype(int)
-    features = ["elo_diff", "spread", "over_under"]
-    # keep rows that have non-null label
-    df = df.dropna(subset=["home_win"])
-    return df, features
+def predict_game_row(row: pd.Series, model_info: dict):
+    """
+    Returns dictionary:
+      home_prob (0-1)
+      model_spread (home - away, positive => home favored)
+      pred_home_score, pred_away_score
+    Logic:
+      - if team averages exist use them to predict scores
+      - otherwise default to 21 - 21
+      - home_field_advantage ~ 2.5 points
+      - simple logistic function on spread -> prob
+    """
+    home = row.get("home_team", "")
+    away = row.get("away_team", "")
+    team_avg = model_info.get("team_avg", {}) if model_info else {}
 
-def train_or_load_model(hist_df: pd.DataFrame):
-    # If a model file exists, load it
-    if os.path.exists(MODEL_PATH):
-        try:
-            with open(MODEL_PATH, "rb") as f:
-                mdl = pickle.load(f)
-            return mdl, DEFAULT_FEATURES
-        except Exception:
-            pass
+    home_off = team_avg.get(home, {}).get("scored", 21.0)
+    home_def = team_avg.get(home, {}).get("allowed", 21.0)
+    away_off = team_avg.get(away, {}).get("scored", 21.0)
+    away_def = team_avg.get(away, {}).get("allowed", 21.0)
 
-    # train if enough labeled historical rows exist
-    df, features = prepare_training_df(hist_df)
-    if df is None or df.empty or len(df) < 250:
-        # fallback: create a trivial model (uses only elo_diff)
-        mdl = LogisticRegression()
-        # train on simulated small set with elo only
-        X = np.random.normal(0, 100, size=(200, 1))
-        y = (X[:, 0] > 0).astype(int)
-        try:
-            mdl.fit(X, y)
-            # wrap predictor to expect features list
-            class SimpleWrapper:
-                def __init__(self, model):
-                    self.model = model
-                    self.features = ["elo_diff"]
-                def predict_proba(self, X):
-                    return self.model.predict_proba(X)
-            wrapper = SimpleWrapper(mdl)
-            # save wrapper minimally
-            with open(MODEL_PATH, "wb") as f:
-                pickle.dump(wrapper, f)
-            return wrapper, ["elo_diff"]
-        except Exception:
-            return None, ["elo_diff"]
+    # naive predicted points: average of offense and opponent allowed
+    pred_home = (home_off + away_def) / 2.0 + 2.5  # home field advantage
+    pred_away = (away_off + home_def) / 2.0
 
-    # proceed with training
-    X = df[features].fillna(0).values
-    y = df["home_win"].values
-    mdl = LogisticRegression(max_iter=200)
-    mdl.fit(X, y)
-    # save
-    try:
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(mdl, f)
-    except Exception:
-        pass
-    return mdl, features
+    model_spread = pred_home - pred_away  # positive -> home favored
+    # convert spread to probability via logistic
+    def spread_to_prob(sp):
+        # parameter scale ~ 7 => 7 points ~ 70/30 split
+        k = 0.18
+        prob = 1.0 / (1.0 + math.exp(-k * sp))
+        return prob
 
-def has_trained_model():
-    return os.path.exists(MODEL_PATH)
+    home_prob = spread_to_prob(model_spread)
 
-def predict_row(model, Xrow: dict):
-    # model must provide predict_proba over features. We support sklearn LogisticRegression or wrapped fallback.
-    if model is None:
-        return None, None, None
-    # prepare feature vector in the expected order; try common feature orders
-    if hasattr(model, "features"):
-        features = model.features
-    else:
-        # default features
-        features = ["elo_diff", "spread", "over_under"]
-    vals = []
-    for f in features:
-        v = Xrow.get(f, np.nan)
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            v = 0.0
-        vals.append(float(v))
-    X = np.array(vals).reshape(1, -1)
-    # if model expects 1 feature (simple fallback), slice
-    try:
-        probs = model.predict_proba(X)
-        prob_home = float(probs[0][1])
-    except Exception:
-        # try with first column only
-        try:
-            probs = model.predict_proba(X[:, :1])
-            prob_home = float(probs[0][1])
-        except Exception:
-            prob_home = None
-    # simple score projection: use elo_diff to split 48 points baseline
-    pred_home_pts = 24 + (vals[0] / 100.0) * 7 if len(vals) > 0 else 24
-    pred_away_pts = 24 - (vals[0] / 100.0) * 7 if len(vals) > 0 else 24
-    return prob_home, pred_home_pts, pred_away_pts
+    return {
+        "home_prob": home_prob,
+        "model_spread": round(model_spread, 1),
+        "pred_home_score": round(pred_home, 1),
+        "pred_away_score": round(pred_away, 1)
+    }

@@ -1,82 +1,86 @@
 # covers_odds.py
-import time
-import re
+"""
+Lightweight Covers.com scraper (best-effort) that returns a DataFrame with:
+columns: home, away, spread, over_under
+This is fragile (site may change). We keep it defensive and best-effort.
+"""
+
 import requests
 from bs4 import BeautifulSoup
+import re
 import pandas as pd
+import time
+import os
 
-REQUEST_DELAY = 0.6
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DJBetsBot/1.0)"}
-
-def _parse_row_text_for_numbers(text: str):
-    nums = re.findall(r"([+-]?\d+(?:\.\d+)?)", text)
-    parsed = {"spread": None, "over_under": None}
-    for n in nums:
-        try:
-            v = float(n)
-            if abs(v) > 20:
-                parsed["over_under"] = v
-            else:
-                if parsed["spread"] is None:
-                    parsed["spread"] = v
-        except:
-            continue
-    return parsed
+REQUEST_DELAY = 0.8
+HEADERS = {"User-Agent":"Mozilla/5.0 (compatible; DJBetsBot/1.0)"}
 
 def parse_covers_game_row(tr):
     try:
-        # try to find team names
-        matchup = tr.find(class_="cmg_teamName") if tr else None
-        text = tr.get_text(" ", strip=True) if tr else ""
-        teams = []
-        if matchup:
-            spans = matchup.find_all("span")
+        text = tr.get_text(" ", strip=True)
+        # find teams: look for ' at ' or ' vs ' or splits
+        # prefer elements with class team-name
+        teams=[]
+        if hasattr(tr, "find_all"):
+            spans = tr.find_all(class_=re.compile("team"))
             for s in spans:
                 t = s.get_text(strip=True)
                 if t:
                     teams.append(t)
-        # fallback: parse by " at " or " vs "
         if len(teams) < 2:
-            parts = text.split(" at ")
-            if len(parts) == 2:
-                teams = [parts[0].strip(), parts[1].strip()]
-            else:
+            # fallback
+            if " at " in text:
+                parts = text.split(" at ")
+                teams = [parts[0].strip(), parts[1].split()[0].strip()]
+            elif " vs " in text:
                 parts = text.split(" vs ")
-                if len(parts) == 2:
-                    teams = [parts[0].strip(), parts[1].strip()]
+                teams = [parts[0].strip(), parts[1].split()[0].strip()]
+
         if len(teams) < 2:
             return None
-        away = teams[0]
-        home = teams[1]
-        parsed = _parse_row_text_for_numbers(text)
-        return {"home": home, "away": away, "spread": parsed["spread"], "over_under": parsed["over_under"]}
+        away, home = teams[0], teams[1]
+
+        # numeric heuristics for spread and total
+        spread = None
+        ou = None
+        nums = re.findall(r"([+-]?\d+(?:\.\d+)?)", text)
+        for n in nums:
+            try:
+                v = float(n)
+                if abs(v) > 20:
+                    ou = v
+                else:
+                    if spread is None:
+                        spread = v
+            except:
+                pass
+        return {"home": home, "away": away, "spread": spread, "over_under": ou}
     except Exception:
         return None
 
-def fetch_covers_for_week(year: int, week: int) -> pd.DataFrame:
+def fetch_covers_for_week(year:int, week:int):
+    results=[]
     urls = [
         f"https://www.covers.com/sports/nfl/matchups?selectedDate={year}-W{week}",
-        "https://www.covers.com/sports/nfl/matchups",
+        "https://www.covers.com/sports/nfl/matchups"
     ]
-    rows = []
-    for url in urls:
+    for u in urls:
         try:
             time.sleep(REQUEST_DELAY)
-            r = requests.get(url, headers=HEADERS, timeout=8)
+            r = requests.get(u, headers=HEADERS, timeout=8)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
-            # covers often uses table rows
-            trs = soup.select("table.cmg_matchup_table tbody tr")
-            if not trs:
-                trs = soup.select("div.cmg_matchup_game_box")
-            for tr in trs:
-                parsed = parse_covers_game_row(tr)
-                if parsed:
-                    rows.append(parsed)
-            if rows:
+            rows = soup.select("table tbody tr")
+            if not rows:
+                rows = soup.find_all("div", class_="cmg_matchup_game_box")
+            for tr in rows:
+                p = parse_covers_game_row(tr)
+                if p:
+                    results.append(p)
+            if results:
                 break
         except Exception:
             continue
-    if not rows:
+    if not results:
         return pd.DataFrame()
-    return pd.DataFrame(rows)
+    return pd.DataFrame(results)
