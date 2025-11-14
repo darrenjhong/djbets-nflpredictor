@@ -340,37 +340,64 @@ def compute_model_record(history_df: pd.DataFrame, model, elos: dict) -> Tuple[i
     return correct, total-correct, correct/total*100.0
 
 # -----------------------
-# UI / App start
-# -----------------------
-st.title("🏈 DJBets — NFL Predictor")
-
-# -----------------------
-# Sidebar (Style A)
+# Sidebar (Style A — fixed)
 # -----------------------
 with st.sidebar:
+
+    # Icon centered
     st.markdown("""
-    <div style='text-align:center; margin-bottom:15px;'>
+    <div style='text-align:center; margin-bottom:10px;'>
         <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("## 🏈 DJBets NFL Predictor")
 
-    # WEEK SELECTOR
-    available_weeks = sorted(schedule_df["week"].dropna().unique().tolist()) or list(range(1,19))
+    # -----------------------
+    # Week selector (NO WARNINGS)
+    # -----------------------
+    st.markdown("### 📅 Select Week")
+
+    try:
+        weeks = sorted(schedule_df["week"].dropna().unique().tolist())
+        if not weeks:
+            weeks = list(range(1, 19))
+    except Exception:
+        weeks = list(range(1, 19))
+
     current_week = st.selectbox(
-        "Select Week",
-        available_weeks,
-        index=0
+        "Choose Week",
+        weeks,
+        index=0,
+        key="week_selector"
     )
 
+    # -----------------------
+    # Model Controls
+    # -----------------------
     st.markdown("### ⚙️ Model Controls")
-    market_weight = st.slider("Market weight (blend model <> market)", 0.0, 1.0, 0.0, 0.01)
-    bet_threshold = st.slider("Bet threshold (edge pts)", 0.0, 20.0, 5.0, 0.5)
 
+    market_weight = st.slider(
+        "Market weight (blend model <> market)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.01
+    )
+
+    bet_threshold = st.slider(
+        "Bet threshold (edge pts)",
+        min_value=0.0,
+        max_value=20.0,
+        value=5.0,
+        step=0.5
+    )
+
+    # -----------------------
+    # Model Record
+    # -----------------------
     st.markdown("### 📊 Model Record")
-    st.info("Model trained using local archive + Elo fallback.")
-
+    st.info("Model trained using local data + Elo fallback.")
 # -------------------------
 # MAIN: Load schedule
 # Covers primary → ESPN fallback → empty rows w/ only teams
