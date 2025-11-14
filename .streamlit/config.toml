@@ -1,7 +1,9 @@
 ﻿[theme]
 base="dark"
-primaryColor="#00BFFF"
+primaryColor="#00A2FF"
 backgroundColor="#0E1117"
-secondaryBackgroundColor="#1E2027"
-textColor="#FAFAFA"
-font="sans serif"
+secondaryBackgroundColor="#1C1F26"
+textColor="#FFFFFF"
+
+[server]
+enableXsrfProtection=false
