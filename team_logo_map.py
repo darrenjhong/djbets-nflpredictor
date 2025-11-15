@@ -44,16 +44,45 @@ TEAM_CANONICAL = {
     "rams":"los_angeles_rams"
 }
 
+TEAM_CANONICAL.update({
+    "nyg": "new_york_giants",
+    "ny giants": "new_york_giants",
+    "nyj": "new_york_jets",
+    "ny jets": "new_york_jets",
+    "la chargers": "los_angeles_chargers",
+    "la rams": "los_angeles_rams",
+})
+
+
 def canonical_team_name(name: str) -> str:
     if not name:
         return ""
     n = str(name).lower().strip()
+
+    # Normalize common punctuation from Covers/ESPN
+    n = n.replace(".", "")          # "n.y. giants" -> "ny giants"
+    n = n.replace("@", "")          # just in case
+    n = n.replace("  ", " ")
+
+    # Extra aliases for Covers-style abbreviations
+    if n in ("ny giants", "ny gaints"):  # typo-safe
+        n = "nyg"
+    if n in ("ny jets",):
+        n = "nyj"
+    if n in ("la chargers",):
+        n = "lac"
+    if n in ("la rams",):
+        n = "lar"
+
     if n in TEAM_CANONICAL:
         return TEAM_CANONICAL[n]
+
     # try remove trailing s
     if n.endswith("s") and n[:-1] in TEAM_CANONICAL:
         return TEAM_CANONICAL[n[:-1]]
+
     return n.replace(" ", "_")
+
 
 def get_logo_path(canonical_name: str) -> str:
     if not canonical_name:
