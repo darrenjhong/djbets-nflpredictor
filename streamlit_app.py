@@ -279,7 +279,7 @@ def model_predict(row):
 
 
 # ============================================================
-# GAME ROW DISPLAY (Streamlit layout, no raw HTML for logos)
+# GAME ROW DISPLAY (centered away/home with '@' between)
 # ============================================================
 
 def render_game_row(row):
@@ -295,35 +295,52 @@ def render_game_row(row):
     home_score = row.get("home_score", np.nan)
     away_score = row.get("away_score", np.nan)
 
-    # Layout: three columns for away team, "@", home team
+    # Layout: three main columns for away, '@', home
     col_away, col_mid, col_home = st.columns([3, 1, 3])
 
-    # Helper to format score nicely
     def fmt_score(val):
         return "" if pd.isna(val) else f"Score: {int(val)}"
 
+    # Away side centered within its column via subcolumns
     with col_away:
-        if away_logo:
-            # Smaller logos via fixed width, no use_column_width override
-            st.image(away_logo, width=120)
-        st.markdown(f"**{away.title()}**")
-        sc = fmt_score(away_score)
-        if sc:
-            st.markdown(sc)
+        sub1, sub2, sub3 = st.columns([1, 2, 1])
+        with sub2:
+            if away_logo:
+                st.image(away_logo, width=120)
+            st.markdown(
+                f"<div style='text-align:center;'>{away.title()}</div>",
+                unsafe_allow_html=True,
+            )
+            sc = fmt_score(away_score)
+            if sc:
+                st.markdown(
+                    f"<div style='text-align:center;'>{sc}</div>",
+                    unsafe_allow_html=True,
+                )
 
+    # Center column with '@'
     with col_mid:
         st.markdown(
             "<div style='text-align:center; font-size:24px; font-weight:600;'>@</div>",
             unsafe_allow_html=True,
         )
 
+    # Home side centered within its column via subcolumns
     with col_home:
-        if home_logo:
-            st.image(home_logo, width=120)
-        st.markdown(f"**{home.title()}**")
-        sc = fmt_score(home_score)
-        if sc:
-            st.markdown(sc)
+        sub1, sub2, sub3 = st.columns([1, 2, 1])
+        with sub2:
+            if home_logo:
+                st.image(home_logo, width=120)
+            st.markdown(
+                f"<div style='text-align:center;'>{home.title()}</div>",
+                unsafe_allow_html=True,
+            )
+            sc = fmt_score(home_score)
+            if sc:
+                st.markdown(
+                    f"<div style='text-align:center;'>{sc}</div>",
+                    unsafe_allow_html=True,
+                )
 
     # Second row: spread / total / prediction / final score
     spread_val = row["spread"] if row["spread"] == row["spread"] else "—"
@@ -350,15 +367,6 @@ def render_game_row(row):
 # ============================================================
 
 with st.sidebar:
-    st.markdown(
-        """
-<div style='text-align:center; margin-bottom:15px;'>
-    <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     st.markdown("## 🏈 DJBets NFL Predictor")
 
     # Load fastR for week selector (fallback to full 1-18 range)
