@@ -11,6 +11,7 @@ import numpy as np
 import requests
 from io import StringIO
 import os
+import textwrap
 
 # --------------------------
 # CONFIG
@@ -26,6 +27,7 @@ FASTR_URL = (
     "https://raw.githubusercontent.com/"
     "nflverse/nflverse-data/master/releases/games.csv"
 )
+
 
 @st.cache_data(show_spinner=False)
 def load_fastr_schedule(season: int):
@@ -47,11 +49,11 @@ def load_fastr_schedule(season: int):
         if "week" in df.columns:
             df = df[df["week"].between(1, 18)]
         if "game_type" in df.columns:
-            df = df[df["game_type"] == "reg"]
+            df = df[df["game_type"].str.upper() == "REG"]
 
         keep = [
             "season", "week", "home_team", "away_team",
-            "home_score", "away_score", "gameday", "game_id"
+            "home_score", "away_score", "gameday", "game_id",
         ]
         df = df[[c for c in keep if c in df.columns]]
         return df.reset_index(drop=True)
@@ -59,6 +61,7 @@ def load_fastr_schedule(season: int):
     except Exception as e:
         print("[FASTR ERROR]", e)
         return pd.DataFrame()
+
 
 # ============================================================
 # COVERS — SCRAPE ODDS & SPREADS
@@ -105,6 +108,7 @@ def covers_fetch_week(season: int, week: int):
         print("[COVERS ERROR]", e)
         return pd.DataFrame()
 
+
 # ============================================================
 # ESPN — fallback scoreboard
 # ============================================================
@@ -132,20 +136,34 @@ def espn_fetch_week(season: int, week: int):
             away = next((t for t in teams if t.get("homeAway") == "away"), {})
             home = next((t for t in teams if t.get("homeAway") == "home"), {})
 
-            rows.append({
-                "season": season,
-                "week": week,
-                "away_team": away.get("team", {}).get("displayName", "").lower(),
-                "home_team": home.get("team", {}).get("displayName", "").lower(),
-                "away_score": int(away.get("score", 0)) if away.get("score") else np.nan,
-                "home_score": int(home.get("score", 0)) if home.get("score") else np.nan,
-                "status": ev.get("status", {}).get("type", {}).get("description", "scheduled").lower(),
-            })
+            rows.append(
+                {
+                    "season": season,
+                    "week": week,
+                    "away_team": away.get("team", {})
+                    .get("displayName", "")
+                    .lower(),
+                    "home_team": home.get("team", {})
+                    .get("displayName", "")
+                    .lower(),
+                    "away_score": int(away.get("score", 0))
+                    if away.get("score")
+                    else np.nan,
+                    "home_score": int(home.get("score", 0))
+                    if home.get("score")
+                    else np.nan,
+                    "status": ev.get("status", {})
+                    .get("type", {})
+                    .get("description", "scheduled")
+                    .lower(),
+                }
+            )
         return pd.DataFrame(rows)
 
     except Exception as e:
         print("[ESPN ERROR]", e)
         return pd.DataFrame()
+
 
 # ============================================================
 # LOGOS
@@ -158,6 +176,7 @@ def logo_path(team: str):
     fname = f"{team.lower().replace(' ', '_')}.png"
     p = os.path.join(LOGO_PATH, fname)
     return p if os.path.exists(p) else ""
+
 
 # ============================================================
 # BUILD WEEK SCHEDULE
@@ -212,12 +231,14 @@ def build_week_schedule(season: int, week: int):
 
         for i, r in block.iterrows():
             hit = covers[
-                (covers["home_team"] == r["home_team"]) &
-                (covers["away_team"] == r["away_team"])
+                (covers["home_team"] == r["home_team"])
+                & (covers["away_team"] == r["away_team"])
             ]
             if not hit.empty:
                 block.loc[i, "spread"] = hit.iloc[0].get("spread", np.nan)
-                block.loc[i, "over_under"] = hit.iloc[0].get("over_under", np.nan)
+                block.loc[i, "over_under"] = hit.iloc[0].get(
+                    "over_under", np.nan
+                )
 
     # ESPN as score/status overlay (even if ESPN was the base, this is harmless)
     espn = espn_fetch_week(season, week)
@@ -228,8 +249,8 @@ def build_week_schedule(season: int, week: int):
 
         for i, r in block.iterrows():
             hit = espn[
-                (espn["home_team"] == r["home_team"]) &
-                (espn["away_team"] == r["away_team"])
+                (espn["home_team"] == r["home_team"])
+                & (espn["away_team"] == r["away_team"])
             ]
             if not hit.empty:
                 row = hit.iloc[0]
@@ -238,6 +259,7 @@ def build_week_schedule(season: int, week: int):
                 block.loc[i, "status"] = row.get("status", "scheduled")
 
     return block.reset_index(drop=True)
+
 
 # ============================================================
 # MODEL (placeholder prediction)
@@ -251,6 +273,7 @@ def model_predict(row):
     diff = h - a
     pred = row["home_team"] if diff > 0 else row["away_team"]
     return pred, diff
+
 
 # ============================================================
 # GAME ROW DISPLAY
@@ -272,31 +295,33 @@ def render_game_row(row):
     logo_style = "height:55px; margin-bottom:4px;"
 
     # MAIN MATCHUP ROW (HTML rendered via st.markdown)
-    html_top = f"""
-    <div style="
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        padding:18px 0;
-        border-bottom:1px solid #e5e5e5;
-    ">
+    html_top = textwrap.dedent(
+        f"""
+        <div style="
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            padding:18px 0;
+            border-bottom:1px solid #e5e5e5;
+        ">
 
-        <div style="width:30%; text-align:center;">
-            <img src="{away_logo}" style="{logo_style}">
-            <div style="margin-top:6px; font-size:17px;">{away.title()}</div>
+            <div style="width:30%; text-align:center;">
+                <img src="{away_logo}" style="{logo_style}">
+                <div style="margin-top:6px; font-size:17px;">{away.title()}</div>
+            </div>
+
+            <div style="width:10%; text-align:center; font-size:28px; font-weight:600;">
+                @
+            </div>
+
+            <div style="width:30%; text-align:center;">
+                <img src="{home_logo}" style="{logo_style}">
+                <div style="margin-top:6px; font-size:17px;">{home.title()}</div>
+            </div>
+
         </div>
-
-        <div style="width:10%; text-align:center; font-size:28px; font-weight:600;">
-            @
-        </div>
-
-        <div style="width:30%; text-align:center;">
-            <img src="{home_logo}" style="{logo_style}">
-            <div style="margin-top:6px; font-size:17px;">{home.title()}</div>
-        </div>
-
-    </div>
-    """
+        """
+    )
     st.markdown(html_top, unsafe_allow_html=True)
 
     # Prediction + Spread + Score
@@ -304,28 +329,42 @@ def render_game_row(row):
     if status in ("final", "complete", "post"):
         score_text = f"<b>Final Score:</b> {away_score} – {home_score}"
 
-    html_bottom = f"""
-    <div style="padding: 10px 4px 20px;">
-        <b>Spread:</b> {row['spread'] if row['spread']==row['spread'] else '—'}
-        &nbsp; | &nbsp;
-        <b>Total:</b> {row['over_under'] if row['over_under']==row['over_under'] else '—'}
-        <br><br>
+    html_bottom = textwrap.dedent(
+        f"""
+        <div style="padding: 10px 4px 20px;">
+            <b>Spread:</b> {row['spread'] if row['spread']==row['spread'] else '—'}
+            &nbsp; | &nbsp;
+            <b>Total:</b> {row['over_under'] if row['over_under']==row['over_under'] else '—'}
+            <br><br>
 
-        <b>Model Pick:</b>
-        <span style="color:#00b300; font-size:18px;">
-            {pred.title()} by {abs(edge):.1f} pts
-        </span>
-        <br>
-        {score_text}
-    </div>
-    """
+            <b>Model Pick:</b>
+            <span style="color:#00b300; font-size:18px;">
+                {pred.title()} by {abs(edge):.1f} pts
+            </span>
+            <br>
+            {score_text}
+        </div>
+        """
+    )
     st.markdown(html_bottom, unsafe_allow_html=True)
+
 
 # ============================================================
 # UI START
 # ============================================================
 
 with st.sidebar:
+    st.markdown(
+        textwrap.dedent(
+            """
+            <div style='text-align:center; margin-bottom:15px;'>
+                <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
     st.markdown("## 🏈 DJBets NFL Predictor")
 
     # Load fastR for week selector (fallback to full 1-18 range)
@@ -366,4 +405,4 @@ st.success(f"Loaded {len(sched)} games for Week {current_week}")
 
 # Render each game row
 for _, row in sched.iterrows():
-    render_game_row(row)
+    renderr_game_row(row)
