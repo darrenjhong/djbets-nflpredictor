@@ -405,4 +405,4 @@ st.success(f"Loaded {len(sched)} games for Week {current_week}")
 
 # Render each game row
 for _, row in sched.iterrows():
-    renderr_game_row(row)
+    render_game_row(row)
