@@ -5,17 +5,16 @@ import requests
 # ---------------------------------------------
 # Safe JSON fetch (used for ESPN scoreboard)
 # ---------------------------------------------
-def safe_request_json(url: str, timeout: float = 10.0):
+def safe_request_json(url: str, params=None, timeout: float = 10.0):
     """
     Fetch JSON safely. Returns {} instead of throwing.
     """
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception:
         return {}
-
 
 # ---------------------------------------------
 # Team logo path resolution
