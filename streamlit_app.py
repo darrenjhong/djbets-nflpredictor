@@ -22,8 +22,10 @@ LOGO_PATH = "public/logos"
 # LOAD FASTR SCHEDULE (Primary Source)
 # ============================================================
 
-FASTR_URL = "https://raw.githubusercontent.com/nflverse/nflverse-data/master/releases/games.csv"
-
+FASTR_URL = (
+    "https://raw.githubusercontent.com/"
+    "nflverse/nflverse-data/master/releases/games.csv"
+)
 
 @st.cache_data(show_spinner=False)
 def load_fastr_schedule(season: int):
@@ -39,21 +41,13 @@ def load_fastr_schedule(season: int):
         # Normalize column names
         df.columns = [c.lower().strip() for c in df.columns]
 
-        # Filter to this season and regular-season weeks
+        # Filter to this season and regular-season weeks if columns exist
         if "season" in df.columns:
             df = df[df["season"] == season]
         if "week" in df.columns:
             df = df[df["week"].between(1, 18)]
         if "game_type" in df.columns:
-            df = df[df["game_type"] == "REG"]
-
-        # Ensure expected columns exist or are renamed
-        df = df.rename(columns={
-            "home_team": "home_team",
-            "away_team": "away_team",
-            "home_score": "home_score",
-            "away_score": "away_score",
-        })
+            df = df[df["game_type"] == "reg"]
 
         keep = [
             "season", "week", "home_team", "away_team",
@@ -277,85 +271,79 @@ def render_game_row(row):
 
     logo_style = "height:55px; margin-bottom:4px;"
 
-    # MAIN MATCHUP ROW
-    st.markdown(
-        f"""
-        <div style="
-            display:flex;
-            justify-content:space-between;
-            align-items:center;
-            padding:18px 0;
-            border-bottom:1px solid #e5e5e5;
-        ">
+    # MAIN MATCHUP ROW (HTML rendered via st.markdown)
+    html_top = f"""
+    <div style="
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        padding:18px 0;
+        border-bottom:1px solid #e5e5e5;
+    ">
 
-            <div style="width:30%; text-align:center;">
-                <img src="{away_logo}" style="{logo_style}">
-                <div style="margin-top:6px; font-size:17px;">{away.title()}</div>
-            </div>
-
-            <div style="width:10%; text-align:center; font-size:28px; font-weight:600;">
-                @
-            </div>
-
-            <div style="width:30%; text-align:center;">
-                <img src="{home_logo}" style="{logo_style}">
-                <div style="margin-top:6px; font-size:17px;">{home.title()}</div>
-            </div>
-
+        <div style="width:30%; text-align:center;">
+            <img src="{away_logo}" style="{logo_style}">
+            <div style="margin-top:6px; font-size:17px;">{away.title()}</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+
+        <div style="width:10%; text-align:center; font-size:28px; font-weight:600;">
+            @
+        </div>
+
+        <div style="width:30%; text-align:center;">
+            <img src="{home_logo}" style="{logo_style}">
+            <div style="margin-top:6px; font-size:17px;">{home.title()}</div>
+        </div>
+
+    </div>
+    """
+    st.markdown(html_top, unsafe_allow_html=True)
 
     # Prediction + Spread + Score
     score_text = ""
     if status in ("final", "complete", "post"):
-        score_text = f"**Final Score:** {away_score} – {home_score}"
+        score_text = f"<b>Final Score:</b> {away_score} – {home_score}"
 
-    st.markdown(
-        f"""
-        <div style="padding: 10px 4px 20px;">
-            <b>Spread:</b> {row['spread'] if row['spread']==row['spread'] else '—'}
-            &nbsp; | &nbsp;
-            <b>Total:</b> {row['over_under'] if row['over_under']==row['over_under'] else '—'}
-            <br><br>
+    html_bottom = f"""
+    <div style="padding: 10px 4px 20px;">
+        <b>Spread:</b> {row['spread'] if row['spread']==row['spread'] else '—'}
+        &nbsp; | &nbsp;
+        <b>Total:</b> {row['over_under'] if row['over_under']==row['over_under'] else '—'}
+        <br><br>
 
-            <b>Model Pick:</b>
-            <span style="color:#00b300; font-size:18px;">
-                {pred.title()} by {abs(edge):.1f} pts
-            </span>
-            <br>
-            {score_text}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        <b>Model Pick:</b>
+        <span style="color:#00b300; font-size:18px;">
+            {pred.title()} by {abs(edge):.1f} pts
+        </span>
+        <br>
+        {score_text}
+    </div>
+    """
+    st.markdown(html_bottom, unsafe_allow_html=True)
 
 # ============================================================
 # UI START
 # ============================================================
 
 with st.sidebar:
-    st.markdown(
-        """
-        <div style='text-align:center; margin-bottom:15px;'>
-            <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     st.markdown("## 🏈 DJBets NFL Predictor")
 
     # Load fastR for week selector (fallback to full 1-18 range)
     fast_df = load_fastr_schedule(CURRENT_SEASON)
-    weeks = sorted(fast_df["week"].unique().tolist()) if not fast_df.empty and "week" in fast_df.columns else list(range(1, 19))
+    if not fast_df.empty and "week" in fast_df.columns:
+        weeks = sorted(fast_df["week"].unique().tolist())
+    else:
+        weeks = list(range(1, 19))
 
     current_week = st.selectbox("Select Week", weeks, index=0)
 
     st.markdown("### ⚙️ Model Controls")
-    market_weight = st.slider("Market weight (blend model <> market)", 0.0, 1.0, 0.0, 0.01)
-    bet_threshold = st.slider("Bet threshold (edge pts)", 0.0, 20.0, 5.0, 0.5)
+    market_weight = st.slider(
+        "Market weight (blend model <> market)", 0.0, 1.0, 0.0, 0.01
+    )
+    bet_threshold = st.slider(
+        "Bet threshold (edge pts)", 0.0, 20.0, 5.0, 0.5
+    )
 
     st.markdown("### 📊 Model Record")
     st.info("Model trained using local data + Elo fallback.")
@@ -368,7 +356,10 @@ with st.spinner(f"Loading schedule for week {current_week}..."):
     sched = build_week_schedule(CURRENT_SEASON, int(current_week))
 
 if sched.empty:
-    st.error("No schedule found from Covers, fastR, or ESPN. This may be temporary (Cloudflare). Try again later.")
+    st.error(
+        "No schedule found from Covers, fastR, or ESPN. "
+        "This may be temporary (Cloudflare). Try again later."
+    )
     st.stop()
 
 st.success(f"Loaded {len(sched)} games for Week {current_week}")
