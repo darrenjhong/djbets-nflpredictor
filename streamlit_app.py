@@ -71,7 +71,11 @@ def covers_fetch_week(season: int, week: int):
     """
     Returns DataFrame:
     away_team, home_team, spread, over_under
+
     Scrapes Covers.com's NFL matchups page for that season/week.
+    If Covers changes its HTML or blocks scraping (Cloudflare),
+    this may return an empty DataFrame, in which case spreads/totals
+    will remain NaN and render as '—' in the UI.
     """
     try:
         url = f"https://www.covers.com/sports/nfl/matchups?season={season}&week={week}"
@@ -275,7 +279,7 @@ def model_predict(row):
 
 
 # ============================================================
-# GAME ROW DISPLAY (no raw HTML)
+# GAME ROW DISPLAY (Streamlit layout, no raw HTML for logos)
 # ============================================================
 
 def render_game_row(row):
@@ -288,42 +292,53 @@ def render_game_row(row):
     pred, edge = model_predict(row)
 
     status = row.get("status", "")
-    home_score = row.get("home_score", None)
-    away_score = row.get("away_score", None)
+    home_score = row.get("home_score", np.nan)
+    away_score = row.get("away_score", np.nan)
 
     # Layout: three columns for away team, "@", home team
     col_away, col_mid, col_home = st.columns([3, 1, 3])
 
+    # Helper to format score nicely
+    def fmt_score(val):
+        return "" if pd.isna(val) else f"Score: {int(val)}"
+
     with col_away:
         if away_logo:
-            st.image(away_logo, use_column_width=False, width=80)
-        st.markdown(f"{away.title()}")
+            # Smaller logos via fixed width, no use_column_width override
+            st.image(away_logo, width=120)
+        st.markdown(f"**{away.title()}**")
+        sc = fmt_score(away_score)
+        if sc:
+            st.markdown(sc)
 
     with col_mid:
         st.markdown(
-            "<div style='text-align:center; font-size:28px; font-weight:600;'>@</div>",
+            "<div style='text-align:center; font-size:24px; font-weight:600;'>@</div>",
             unsafe_allow_html=True,
         )
 
     with col_home:
         if home_logo:
-            st.image(home_logo, use_column_width=False, width=80)
-        st.markdown(f"{home.title()}")
+            st.image(home_logo, width=120)
+        st.markdown(f"**{home.title()}**")
+        sc = fmt_score(home_score)
+        if sc:
+            st.markdown(sc)
 
     # Second row: spread / total / prediction / final score
     spread_val = row["spread"] if row["spread"] == row["spread"] else "—"
     total_val = row["over_under"] if row["over_under"] == row["over_under"] else "—"
 
-    score_text = ""
+    score_line = ""
     if status in ("final", "complete", "post"):
-        score_text = f"**Final Score:** {away_score} – {home_score}"
+        score_line = f"**Final Score:** {int(away_score)} – {int(home_score)}"
 
     st.markdown(
         f"""
 **Spread:** {spread_val} | **Total:** {total_val}
 
 **Model Pick:** {pred.title()} by {abs(edge):.1f} pts  
-{score_text}
+{score_line}
         """
     )
 
