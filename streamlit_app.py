@@ -40,17 +40,16 @@ def render_game_row(row):
     home = row["home_team"]
     away = row["away_team"]
 
-    # row teams are already canonical from data_loader.prepare_week_schedule
+    # home/away are canonical names from prepare_week_schedule
     home_logo = get_logo_path(home)
     away_logo = get_logo_path(away)
 
     pred, edge = model_predict(row)
 
-    status = row.get("status", "")
+    status = str(row.get("status", "")).lower()
     home_score = row.get("home_score", np.nan)
     away_score = row.get("away_score", np.nan)
 
-    # Layout: three main columns for away, '@', home
     col_away, col_mid, col_home = st.columns([3, 1, 3])
 
     def fmt_score(val):
@@ -58,8 +57,8 @@ def render_game_row(row):
 
     # Away side centered within its column via subcolumns
     with col_away:
-        sub1, sub2, sub3 = st.columns([1, 2, 1])
-        with sub2:
+        s1, s2, s3 = st.columns([1, 2, 1])
+        with s2:
             if away_logo:
                 st.image(away_logo, width=120)
             st.markdown(
@@ -82,8 +81,8 @@ def render_game_row(row):
 
     # Home side centered within its column via subcolumns
     with col_home:
-        sub1, sub2, sub3 = st.columns([1, 2, 1])
-        with sub2:
+        s1, s2, s3 = st.columns([1, 2, 1])
+        with s2:
             if home_logo:
                 st.image(home_logo, width=120)
             st.markdown(
@@ -102,7 +101,7 @@ def render_game_row(row):
     total_val = row["over_under"] if row["over_under"] == row["over_under"] else "—"
 
     score_line = ""
-    if isinstance(status, str) and status.lower() in ("final", "complete", "post", "status_final"):
+    if status in ("final", "complete", "post", "status_final"):
         score_line = f"**Final Score:** {int(away_score)} – {int(home_score)}"
 
     st.markdown(
@@ -122,7 +121,6 @@ def render_game_row(row):
 # ============================================================
 
 with st.sidebar:
-    # Clean sidebar, no target logo
     st.markdown("## 🏈 DJBets NFL Predictor")
 
     # Load full season schedule once (local CSV or ESPN via data_loader)
@@ -146,29 +144,51 @@ with st.sidebar:
     st.markdown("### 📊 Model Record")
     st.info("Model trained using local data + Elo fallback.")
 
-
 # MAIN TITLE
 st.title(f"DJBets — Season {CURRENT_SEASON} — Week {current_week}")
 
-# FETCH ODDS FROM COVERS FOR THIS WEEK
-with st.spinner(f"Loading Covers odds for Week {current_week}..."):
+# 1) SCHEDULE-ONLY WEEK (guaranteed, since your loader already works)
+with st.spinner(f"Preparing schedule for week {current_week}..."):
+    base_week = prepare_week_schedule(
+        CURRENT_SEASON,
+        int(current_week),
+        schedule_df=full_sched,
+        covers_df=None,  # no odds yet
+    )
+
+if base_week is None or base_week.empty:
+    st.error(
+        "Schedule is empty for this week. Check data_loader or your local schedule file."
+    )
+    st.stop()
+
+# 2) TRY TO FETCH COVERS ODDS AND MERGE
+with st.spinner(f"Fetching Covers odds for Week {current_week}..."):
     covers_df = fetch_covers_for_week(CURRENT_SEASON, int(current_week))
 
-# PREPARE WEEK SCHEDULE (MERGES SCHEDULE + COVERS ODDS)
-with st.spinner(f"Preparing schedule for week {current_week}..."):
+if covers_df is not None and not covers_df.empty:
+    # Merge schedule + covers odds using your canonical logic
     week_sched = prepare_week_schedule(
         CURRENT_SEASON,
         int(current_week),
         schedule_df=full_sched,
         covers_df=covers_df,
     )
+    if week_sched is None or week_sched.empty:
+        # If merge fails for some reason, fall back to schedule-only
+        week_sched = base_week.copy()
+        covers_ok = False
+    else:
+        covers_ok = True
+else:
+    week_sched = base_week.copy()
+    covers_ok = False
 
-if week_sched is None or week_sched.empty:
-    st.error(
-        "No schedule found for this week after merging schedule and Covers odds. "
-        "Covers may be blocking requests or the schedule file may be missing."
+if not covers_ok:
+    st.info(
+        "Covers odds were not attached for this week (site may have changed layout or blocked the request). "
+        "Spreads and totals will show as '—'."
     )
-    st.stop()
 
 st.success(f"Loaded {len(week_sched)} games for Week {current_week}")
 
