@@ -11,7 +11,6 @@ import numpy as np
 import requests
 from io import StringIO
 import os
-import textwrap
 
 # --------------------------
 # CONFIG
@@ -276,7 +275,7 @@ def model_predict(row):
 
 
 # ============================================================
-# GAME ROW DISPLAY
+# GAME ROW DISPLAY (no raw HTML)
 # ============================================================
 
 def render_game_row(row):
@@ -292,61 +291,43 @@ def render_game_row(row):
     home_score = row.get("home_score", None)
     away_score = row.get("away_score", None)
 
-    logo_style = "height:55px; margin-bottom:4px;"
+    # Layout: three columns for away team, "@", home team
+    col_away, col_mid, col_home = st.columns([3, 1, 3])
 
-    # MAIN MATCHUP ROW (HTML rendered via st.markdown)
-    html_top = textwrap.dedent(
-        f"""
-        <div style="
-            display:flex;
-            justify-content:space-between;
-            align-items:center;
-            padding:18px 0;
-            border-bottom:1px solid #e5e5e5;
-        ">
+    with col_away:
+        if away_logo:
+            st.image(away_logo, use_column_width=False, width=80)
+        st.markdown(f"{away.title()}")
 
-            <div style="width:30%; text-align:center;">
-                <img src="{away_logo}" style="{logo_style}">
-                <div style="margin-top:6px; font-size:17px;">{away.title()}</div>
-            </div>
+    with col_mid:
+        st.markdown(
+            "<div style='text-align:center; font-size:28px; font-weight:600;'>@</div>",
+            unsafe_allow_html=True,
+        )
 
-            <div style="width:10%; text-align:center; font-size:28px; font-weight:600;">
-                @
-            </div>
+    with col_home:
+        if home_logo:
+            st.image(home_logo, use_column_width=False, width=80)
+        st.markdown(f"{home.title()}")
 
-            <div style="width:30%; text-align:center;">
-                <img src="{home_logo}" style="{logo_style}">
-                <div style="margin-top:6px; font-size:17px;">{home.title()}</div>
-            </div>
+    # Second row: spread / total / prediction / final score
+    spread_val = row["spread"] if row["spread"] == row["spread"] else "—"
+    total_val = row["over_under"] if row["over_under"] == row["over_under"] else "—"
 
-        </div>
-        """
-    )
-    st.markdown(html_top, unsafe_allow_html=True)
-
-    # Prediction + Spread + Score
     score_text = ""
     if status in ("final", "complete", "post"):
-        score_text = f"<b>Final Score:</b> {away_score} – {home_score}"
+        score_text = f"**Final Score:** {away_score} – {home_score}"
 
-    html_bottom = textwrap.dedent(
+    st.markdown(
         f"""
-        <div style="padding: 10px 4px 20px;">
-            <b>Spread:</b> {row['spread'] if row['spread']==row['spread'] else '—'}
-            &nbsp; | &nbsp;
-            <b>Total:</b> {row['over_under'] if row['over_under']==row['over_under'] else '—'}
-            <br><br>
+**Spread:** {spread_val} | **Total:** {total_val}
 
-            <b>Model Pick:</b>
-            <span style="color:#00b300; font-size:18px;">
-                {pred.title()} by {abs(edge):.1f} pts
-            </span>
-            <br>
-            {score_text}
-        </div>
+**Model Pick:** {pred.title()} by {abs(edge):.1f} pts  
+{score_text}
         """
     )
-    st.markdown(html_bottom, unsafe_allow_html=True)
+
+    st.markdown("---")
 
 
 # ============================================================
@@ -355,13 +336,11 @@ def render_game_row(row):
 
 with st.sidebar:
     st.markdown(
-        textwrap.dedent(
-            """
-            <div style='text-align:center; margin-bottom:15px;'>
-                <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
-            </div>
-            """
-        ),
+        """
+<div style='text-align:center; margin-bottom:15px;'>
+    <img src='https://img.icons8.com/ios-filled/100/target.png' width='60'>
+</div>
+        """,
         unsafe_allow_html=True,
     )
 
