@@ -1,6 +1,7 @@
 ﻿# ------------------------------------------------------------
 # DJBets NFL Predictor — Streamlit App
-# Schedule/scores from data_loader + odds from Covers
+# ESPN schedule + scores, model predictions, logos
+# (Baseline: no Covers integration yet)
 # ------------------------------------------------------------
 
 import streamlit as st
@@ -8,15 +9,192 @@ st.set_page_config(page_title="DJBets NFL Predictor", layout="wide")
 
 import pandas as pd
 import numpy as np
-
-from data_loader import load_or_fetch_schedule, prepare_week_schedule
-from covers_odds import fetch_covers_for_week
-from utils import get_logo_path
+import requests
+from io import StringIO
+import os
 
 # --------------------------
 # CONFIG
 # --------------------------
 CURRENT_SEASON = 2025
+LOGO_PATH = "public/logos"
+
+# ============================================================
+# LOAD FASTR SCHEDULE (Optional Primary Source)
+# ============================================================
+
+FASTR_URL = (
+    "https://raw.githubusercontent.com/"
+    "nflverse/nflverse-data/master/releases/games.csv"
+)
+
+
+@st.cache_data(show_spinner=False)
+def load_fastr_schedule(season: int):
+    """
+    Try to download weekly game schedule from nflverse fastR CSV.
+    If the request fails (404, timeout, etc.), return empty DataFrame.
+    """
+    try:
+        r = requests.get(FASTR_URL, timeout=10)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+
+        # Normalize column names
+        df.columns = [c.lower().strip() for c in df.columns]
+
+        # Filter to this season and regular-season weeks if columns exist
+        if "season" in df.columns:
+            df = df[df["season"] == season]
+        if "week" in df.columns:
+            df = df[df["week"].between(1, 18)]
+        if "game_type" in df.columns:
+            df = df[df["game_type"].str.upper() == "REG"]
+
+        keep = [
+            "season", "week", "home_team", "away_team",
+            "home_score", "away_score", "gameday", "game_id",
+        ]
+        df = df[[c for c in keep if c in df.columns]]
+        return df.reset_index(drop=True)
+
+    except Exception as e:
+        print("[FASTR ERROR]", e)
+        return pd.DataFrame()
+
+
+# ============================================================
+# ESPN — schedule + scores
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def espn_fetch_week(season: int, week: int):
+    """
+    Fetch weekly schedule + scores from ESPN's public scoreboard API.
+    Uses explicit year + seasontype (2 = regular season) + week.
+    """
+    try:
+        url = (
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?year={season}&seasontype=2&week={week}"
+        )
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+
+        rows = []
+        for ev in data.get("events", []):
+            comp = ev.get("competitions", [{}])[0]
+            teams = comp.get("competitors", [])
+
+            away = next((t for t in teams if t.get("homeAway") == "away"), {})
+            home = next((t for t in teams if t.get("homeAway") == "home"), {})
+
+            rows.append(
+                {
+                    "season": season,
+                    "week": week,
+                    "away_team": away.get("team", {})
+                    .get("displayName", "")
+                    .lower(),
+                    "home_team": home.get("team", {})
+                    .get("displayName", "")
+                    .lower(),
+                    "away_score": int(away.get("score", 0))
+                    if away.get("score")
+                    else np.nan,
+                    "home_score": int(home.get("score", 0))
+                    if home.get("score")
+                    else np.nan,
+                    "status": ev.get("status", {})
+                    .get("type", {})
+                    .get("description", "scheduled")
+                    .lower(),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    except Exception as e:
+        print("[ESPN ERROR]", e)
+        return pd.DataFrame()
+
+
+# ============================================================
+# LOGOS
+# ============================================================
+
+def logo_path(team: str):
+    """Return full path for a team logo."""
+    if not team:
+        return ""
+    fname = f"{team.lower().replace(' ', '_')}.png"
+    p = os.path.join(LOGO_PATH, fname)
+    return p if os.path.exists(p) else ""
+
+
+# ============================================================
+# BUILD WEEK SCHEDULE
+# ============================================================
+
+def build_week_schedule(season: int, week: int):
+    """
+    Base schedule: try fastR, then fall back to ESPN.
+    No odds integration; spread/over_under left as NaN.
+    """
+    fastr = load_fastr_schedule(season)
+
+    if not fastr.empty and "week" in fastr.columns:
+        block = fastr[fastr["week"] == week].copy()
+    else:
+        block = pd.DataFrame()
+
+    # ESPN as base or overlay
+    espn = espn_fetch_week(season, week)
+    if not espn.empty:
+        for col in ["home_team", "away_team"]:
+            if col in espn.columns:
+                espn[col] = espn[col].str.lower()
+
+    # If fastR empty, use ESPN as base
+    if block.empty and not espn.empty:
+        block = espn.copy()
+
+    if block.empty:
+        return pd.DataFrame()
+
+    # Normalize base schedule team names
+    for col in ["home_team", "away_team"]:
+        if col in block.columns:
+            block[col] = block[col].str.lower()
+
+    # Ensure required columns exist
+    if "home_score" not in block.columns:
+        block["home_score"] = np.nan
+    if "away_score" not in block.columns:
+        block["away_score"] = np.nan
+    if "status" not in block.columns:
+        block["status"] = "scheduled"
+
+    # Odds fields exist but stay NaN (show as '—' in UI)
+    if "spread" not in block.columns:
+        block["spread"] = np.nan
+    if "over_under" not in block.columns:
+        block["over_under"] = np.nan
+
+    # Overlay ESPN scores/status if fastR was base
+    if not espn.empty:
+        for i, r in block.iterrows():
+            hit = espn[
+                (espn["home_team"] == r["home_team"])
+                & (espn["away_team"] == r["away_team"])
+            ]
+            if not hit.empty:
+                row_e = hit.iloc[0]
+                block.loc[i, "home_score"] = row_e.get("home_score", np.nan)
+                block.loc[i, "away_score"] = row_e.get("away_score", np.nan)
+                block.loc[i, "status"] = row_e.get("status", "scheduled")
+
+    return block.reset_index(drop=True)
 
 
 # ============================================================
@@ -40,13 +218,12 @@ def render_game_row(row):
     home = row["home_team"]
     away = row["away_team"]
 
-    # home/away are canonical names from prepare_week_schedule
-    home_logo = get_logo_path(home)
-    away_logo = get_logo_path(away)
+    home_logo = logo_path(home)
+    away_logo = logo_path(away)
 
     pred, edge = model_predict(row)
 
-    status = str(row.get("status", "")).lower()
+    status = row.get("status", "")
     home_score = row.get("home_score", np.nan)
     away_score = row.get("away_score", np.nan)
 
@@ -62,7 +239,7 @@ def render_game_row(row):
             if away_logo:
                 st.image(away_logo, width=120)
             st.markdown(
-                f"<div style='text-align:center;'>{away.replace('_',' ').title()}</div>",
+                f"<div style='text-align:center;'>{away.title()}</div>",
                 unsafe_allow_html=True,
             )
             sc = fmt_score(away_score)
@@ -86,7 +263,7 @@ def render_game_row(row):
             if home_logo:
                 st.image(home_logo, width=120)
             st.markdown(
-                f"<div style='text-align:center;'>{home.replace('_',' ').title()}</div>",
+                f"<div style='text-align:center;'>{home.title()}</div>",
                 unsafe_allow_html=True,
             )
             sc = fmt_score(home_score)
@@ -101,14 +278,14 @@ def render_game_row(row):
     total_val = row["over_under"] if row["over_under"] == row["over_under"] else "—"
 
     score_line = ""
-    if status in ("final", "complete", "post", "status_final"):
+    if status in ("final", "complete", "post"):
         score_line = f"**Final Score:** {int(away_score)} – {int(home_score)}"
 
     st.markdown(
         f"""
 **Spread:** {spread_val} | **Total:** {total_val}
 
-**Model Pick:** {pred.replace('_',' ').title()} by {abs(edge):.1f} pts  
+**Model Pick:** {pred.title()} by {abs(edge):.1f} pts  
 {score_line}
         """
     )
@@ -116,82 +293,4 @@ def render_game_row(row):
     st.markdown("---")
 
 
-# ============================================================
-# UI START
-# ============================================================
-
-with st.sidebar:
-    st.markdown("## 🏈 DJBets NFL Predictor")
-
-    # Load full season schedule once (local CSV or ESPN via data_loader)
-    full_sched = load_or_fetch_schedule(CURRENT_SEASON)
-
-    if not full_sched.empty and "week" in full_sched.columns:
-        week_options = sorted(full_sched["week"].unique().tolist())
-    else:
-        week_options = list(range(1, 19))
-
-    current_week = st.selectbox("Select Week", week_options, index=0)
-
-    st.markdown("### ⚙️ Model Controls")
-    market_weight = st.slider(
-        "Market weight (blend model <> market)", 0.0, 1.0, 0.0, 0.01
-    )
-    bet_threshold = st.slider(
-        "Bet threshold (edge pts)", 0.0, 20.0, 5.0, 0.5
-    )
-
-    st.markdown("### 📊 Model Record")
-    st.info("Model trained using local data + Elo fallback.")
-
-# MAIN TITLE
-st.title(f"DJBets — Season {CURRENT_SEASON} — Week {current_week}")
-
-# 1) SCHEDULE-ONLY WEEK (guaranteed, since your loader already works)
-with st.spinner(f"Preparing schedule for week {current_week}..."):
-    base_week = prepare_week_schedule(
-        CURRENT_SEASON,
-        int(current_week),
-        schedule_df=full_sched,
-        covers_df=None,  # no odds yet
-    )
-
-if base_week is None or base_week.empty:
-    st.error(
-        "Schedule is empty for this week. Check data_loader or your local schedule file."
-    )
-    st.stop()
-
-# 2) TRY TO FETCH COVERS ODDS AND MERGE
-with st.spinner(f"Fetching Covers odds for Week {current_week}..."):
-    covers_df = fetch_covers_for_week(CURRENT_SEASON, int(current_week))
-
-if covers_df is not None and not covers_df.empty:
-    # Merge schedule + covers odds using your canonical logic
-    week_sched = prepare_week_schedule(
-        CURRENT_SEASON,
-        int(current_week),
-        schedule_df=full_sched,
-        covers_df=covers_df,
-    )
-    if week_sched is None or week_sched.empty:
-        # If merge fails for some reason, fall back to schedule-only
-        week_sched = base_week.copy()
-        covers_ok = False
-    else:
-        covers_ok = True
-else:
-    week_sched = base_week.copy()
-    covers_ok = False
-
-if not covers_ok:
-    st.info(
-        "Covers odds were not attached for this week (site may have changed layout or blocked the request). "
-        "Spreads and totals will show as '—'."
-    )
-
-st.success(f"Loaded {len(week_sched)} games for Week {current_week}")
-
-# Render each game row
-for _, row in week_sched.iterrows():
-    render_game_row(row)
+# =========================================================
